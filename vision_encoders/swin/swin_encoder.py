@@ -83,13 +83,23 @@ class SwinEncoder(nn.Module):
             # checkpoint; keep only the vision encoder and drop the text decoder.
             from transformers import VisionEncoderDecoderModel
 
-            ved = VisionEncoderDecoderModel.from_pretrained(model_name)
+            # low_cpu_mem_usage=False forces the classic (non-meta) init path:
+            # SwinV2 computes relative_position_index / relative_coords_table as
+            # non-persistent buffers in __init__. Under transformers' meta
+            # fast-init those buffers are created on the meta device and never
+            # materialised (they are absent from the checkpoint), so a later
+            # model.to(device) raises "Cannot copy out of meta tensor".
+            ved = VisionEncoderDecoderModel.from_pretrained(
+                model_name, low_cpu_mem_usage=False
+            )
             self.model = ved.encoder
             config = self.model.config
         elif pretrained:
             # Use the classification wrapper first so supervised fine-tuned
             # checkpoints load completely, then keep only the Swin backbone.
-            hf_model = AutoModelForImageClassification.from_pretrained(model_name)
+            hf_model = AutoModelForImageClassification.from_pretrained(
+                model_name, low_cpu_mem_usage=False
+            )
             self.model = getattr(
                 hf_model,
                 "swin",
