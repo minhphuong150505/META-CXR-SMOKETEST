@@ -1,0 +1,5 @@
+numpy==1.26.4
+pandas==2.2.3
+pyarrow==18.1.0
+Pillow==10.4.0
+tqdm==4.67.1
