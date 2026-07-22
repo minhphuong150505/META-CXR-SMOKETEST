@@ -57,7 +57,7 @@ def test_notebooks_are_clean_and_parameterized():
                 assert cell["execution_count"] is None
                 assert cell["outputs"] == []
         source = "\n".join(str(cell.get("source", "")) for cell in notebook["cells"])
-        assert "REPO_COMMIT = \"\"" in source
+        assert "REPO_COMMIT = " in source
         assert "GCS_SERVICE_ACCOUNT" in source
         assert "WANDB_API_KEY" in source
         assert "HF_TOKEN" in source

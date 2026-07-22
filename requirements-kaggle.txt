@@ -14,7 +14,6 @@ timm==0.9.16
 scikit-image==0.24.0
 torchinfo==1.8.0
 wandb==0.18.7
-hi-ml-multimodal==0.2.1
 einops==0.8.0
 fairscale==0.4.13
 kaggle==2.2.3
