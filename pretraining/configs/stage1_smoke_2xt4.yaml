@@ -77,6 +77,11 @@ run:
   warmup_steps: 1
   accum_grad_iters: 64
   max_grad_norm: 1.0
+  # Required: view_fusion is skipped for studies with no auxiliary view, and the
+  # lambda_mpc=0 / lambda_view_consistency=0 terms leave their params without
+  # gradients, so which parameters are used varies per sample and per rank. DDP
+  # rejects that unless unused-parameter detection is on.
+  find_unused_parameters: true
 
   max_len: 256
   min_len: 8
