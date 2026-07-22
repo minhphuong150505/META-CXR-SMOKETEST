@@ -241,11 +241,25 @@ def load_dataset_manifest(dataset_root: str | Path) -> tuple[dict, Path, str]:
 
 def write_runtime_env_config(dataset_root: str | Path, output_dir: str | Path) -> Path:
     root = Path(dataset_root).resolve()
+    # Kaggle decompresses .gz files during dataset ingest, so the CheXpert CSV
+    # may be mounted without its .gz suffix. Resolve whichever variant exists
+    # and fail here, not deep inside the training workers.
+    chexpert_candidates = [
+        root / "mimic-cxr-2.0.0-chexpert-subset.csv.gz",
+        root / "mimic-cxr-2.0.0-chexpert-subset.csv",
+    ]
+    chexpert_csv = next((p for p in chexpert_candidates if p.is_file()), None)
+    if chexpert_csv is None:
+        raise FileNotFoundError(
+            "CheXpert subset CSV not found under "
+            f"{root}: tried {[p.name for p in chexpert_candidates]}; "
+            f"root contains {sorted(p.name for p in root.iterdir())[:20]}"
+        )
     payload = {
         "paths": {
             "dataset_root": str(root),
             "mimic_cxr_jpg_root": str(root),
-            "chexpert_csv": str(root / "mimic-cxr-2.0.0-chexpert-subset.csv.gz"),
+            "chexpert_csv": str(chexpert_csv),
             "processed_train_csv": str(root / "processed" / "train.csv"),
             "processed_val_csv": str(root / "processed" / "val.csv"),
             "processed_test_csv": str(root / "processed" / "test.csv"),
