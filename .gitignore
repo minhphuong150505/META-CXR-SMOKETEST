@@ -1,0 +1,124 @@
+# Virtual environment
+venv/
+env/
+*.egg-info/
+
+# Compiled Python files
+__pycache__/
+.pytest_cache/
+*.pyc
+*.pyd
+*.so
+
+# IDE/Editor specific files
+.vscode/
+.idea/
+
+# Operating System files
+.DS_Store
+Thumbs.db
+
+# Log files
+*.log
+
+# Sensitive configuration files
+.envdata/
+configs/env_config.yaml
+.kaggle/
+**/kaggle.json
+application_default_credentials.json
+cloud/outputs/
+**/.ipynb_checkpoints/
+
+# Credentials. Nothing here is ever a Git payload, on a public remote least of all.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+.netrc
+**/service-account*.json
+**/gcp-*-key.json
+**/*-credentials.json
+**/client_secret*.json
+.gcloud/
+.config/gcloud/
+**/wandb_api_key*
+wandb/
+
+# MIMIC-CXR derived data (PhysioNet credentialed — do NOT redistribute)
+data/
+Report/
+reports/
+processed/
+train_annotation.csv
+*.jsonl
+# Executed preprocessing notebooks: their outputs carry real subject_id/study_id
+# rows, CheXpert label tables, and report snippets.
+preporcessing/preprocessing_walkthrough.ipynb
+preporcessing/kltn-data-preprocessing.ipynb
+predictions*.csv
+references*.csv
+
+# Raw MIMIC-CXR metadata and the image mirror. `files/` is the bucket layout root
+# that `paths.mimic_cxr_jpg_root` points at.
+files/
+*.csv.gz
+mimic-cxr-*.csv
+cxr-record-list*
+cxr-study-list*
+mimic_cxr_cleaned.csv
+chexpert*.csv
+negbio*.csv
+# Split CSVs produced by preporcessing/preprocess_mimic_cxr.py
+train.csv
+val.csv
+test.csv
+*_split.csv
+splits/
+
+# Frozen-encoder feature caches. Derived directly from MIMIC images, so they
+# carry the same redistribution ban as the images themselves.
+features/
+feature_cache/
+*.npy
+*.npz
+*.h5
+*.hdf5
+*.parquet
+*.feather
+*.arrow
+
+# Generated training/evaluation artifacts. These may contain de-identified
+# DICOM/study identifiers or report text and belong only in private storage.
+outputs/
+pretraining/outputs/
+pretraining/cls/
+pretraining/embs/
+training/outputs/
+gradient_log*
+.sensitive_stage1_cache/
+.sensitive_predictions/
+**/.sensitive_stage1_cache/
+**/.sensitive_predictions/
+
+# Model weights and adapters are external artifacts, never Git payloads.
+checkpoints/**
+!checkpoints/.gitkeep
+*.bin
+*.ckpt
+*.pth
+*.pt
+*.safetensors
+
+# Hugging Face cache for the external MedGemma checkpoints (~8 GB), in case
+# HF_HOME is ever pointed inside the working tree.
+hf_cache/
+.hf_cache/
+**/models--*/
+
+cloud/env.local.sh

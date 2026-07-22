@@ -1,0 +1,27 @@
+# Local Stage-1 reference lock. Kaggle uses requirements-kaggle.txt and keeps
+# the image's preinstalled torch/CUDA pair after the notebook compatibility gate.
+torch==2.5.1
+torchvision==0.20.1
+numpy==1.26.4
+pandas==2.2.3
+pyarrow==18.1.0
+Pillow==10.4.0
+transformers==4.53.2
+tokenizers==0.21.4
+huggingface-hub==0.33.4
+omegaconf==2.3.0
+iopath==0.1.10
+timm==0.9.16
+scikit-image==0.24.0
+scikit-learn==1.5.2
+scipy==1.14.1
+torchinfo==1.8.0
+wandb==0.18.7
+hi-ml-multimodal==0.2.1
+einops==0.8.0
+fairscale==0.4.13
+tqdm==4.67.1
+PyYAML==6.0.2
+packaging==24.2
+protobuf==5.29.3
+pytest==8.3.4

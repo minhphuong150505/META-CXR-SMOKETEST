@@ -1,0 +1,15 @@
+# Runtime-only file. Copy to configs/env_config.yaml inside Kaggle working space.
+# Never commit the generated file and never print secret values.
+paths:
+  dataset_root: "/kaggle/input/REPLACE_AT_RUNTIME"
+  mimic_cxr_jpg_root: "${paths.dataset_root}"
+  chexpert_csv: "${paths.dataset_root}/mimic-cxr-2.0.0-chexpert-subset.csv.gz"
+  processed_dir: "${paths.dataset_root}/processed"
+  processed_train_csv: "${paths.processed_dir}/train.csv"
+  processed_val_csv: "${paths.processed_dir}/val.csv"
+  processed_test_csv: "${paths.processed_dir}/test.csv"
+  output_dir: "/kaggle/working/meta-cxr-output"
+
+wandb:
+  entity: ""
+  project: "meta-cxr"

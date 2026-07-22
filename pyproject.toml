@@ -1,0 +1,66 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "meta-cxr"
+version = "0.1.0"
+description = "Minimal META-CXR Stage-1 smoke and encoder-sensitivity pipeline"
+requires-python = ">=3.10"
+# Runtime dependencies live in requirements-stage1.txt (local) and
+# requirements-kaggle.txt (preserving Kaggle's preinstalled torch/CUDA pair).
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["ruff>=0.6", "pytest>=8.0"]
+
+# The evaluator core (classification metrics, AUROC/AUPRC, threshold
+# calibration and bootstrap) needs only numpy, so it
+# runs anywhere the test suite does. These extras are for the parts that do not.
+eval-plots = ["matplotlib>=3.7"]
+
+# Reference implementations for the metrics this repo deliberately does not
+# reimplement. Without them those metrics are reported as unavailable with an
+# install command -- never as a score of 0.
+eval-generation = [
+    "nltk>=3.9",
+    "pycocoevalcap>=1.2",
+    "bert-score>=0.3.13",
+]
+
+# The repo is not yet a src-layout package; modules are imported by path from
+# the repo root. Declaring packages here would misrepresent that. This file
+# exists for tooling configuration, not for distribution.
+[tool.setuptools]
+py-modules = []
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Import mode prepends the rootdir, which is how the path-based imports in
+# tests/conftest.py resolve model/ and model/lavis/ without executing
+# model/lavis/__init__.py.
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+extend-exclude = [
+    # Vendored fork of Salesforce LAVIS. Reformatting it would make every
+    # future upstream diff unreadable.
+    "model/lavis",
+    "notebooks",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = [
+    "E501",   # line length is handled by the formatter, not the linter
+    "B008",   # FastAPI-style default-call pattern is not used here
+    "UP038",  # isinstance tuple form is still faster on 3.10
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests bootstrap sys.path before importing repo modules, so imports cannot
+# all sit at the top of the file.
+"tests/*" = ["E402"]
+"pretraining/train.py" = ["F401"]
