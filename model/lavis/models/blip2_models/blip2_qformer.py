@@ -136,18 +136,27 @@ class Blip2Qformer(Blip2Base):
             num_query_token, vis_num_feat, cross_attention_freq
         )
         self.Qformer.resize_token_embeddings(len(self.tokenizer))
-        # BertLMPredictionHead aliases decoder.bias to cls.predictions.bias.
-        # Under transformers' meta fast-init, resize_token_embeddings rebuilds
-        # cls.predictions.bias as a real tensor but drops that alias, stranding
-        # decoder.bias on the meta device -> a later model.to(device) raises
-        # "Cannot copy out of meta tensor". Restore the alias to the real bias.
+        # transformers' meta fast-init breaks the BertLMPredictionHead bias:
+        # resize_token_embeddings grows decoder.weight (tied to the word
+        # embeddings) to the new vocab size but leaves cls.predictions.bias at
+        # the old size and strands the aliased decoder.bias on the meta device.
+        # Left alone this causes either "Cannot copy out of meta tensor" at
+        # .to(device) or, once re-tied, an LM-head shape mismatch
+        # ("expanded size 30523 must match 30522"). Rebuild the bias to match
+        # decoder.weight (zeros for any newly added rows) and re-tie decoder.bias
+        # to it, so both the meta crash and the size mismatch are fixed.
         _pred = getattr(getattr(self.Qformer, "cls", None), "predictions", None)
-        if (
-            _pred is not None
-            and getattr(getattr(_pred, "decoder", None), "bias", None) is not None
-            and _pred.decoder.bias.is_meta
-        ):
-            _pred.decoder.bias = _pred.bias
+        if _pred is not None and getattr(_pred, "decoder", None) is not None:
+            _vocab = _pred.decoder.weight.shape[0]
+            _old = getattr(_pred, "bias", None)
+            if _old is None or _old.is_meta or _old.shape[0] != _vocab:
+                _new = torch.zeros(_vocab)
+                if _old is not None and not _old.is_meta:
+                    _n = min(_old.shape[0], _vocab)
+                    _new[:_n] = _old.data[:_n]
+                _new = nn.Parameter(_new)
+                _pred.bias = _new
+                _pred.decoder.bias = _new
         state_dict = self.Qformer.state_dict()
         for name, param in self.Qformer.named_parameters():
             if "_query" in name:
