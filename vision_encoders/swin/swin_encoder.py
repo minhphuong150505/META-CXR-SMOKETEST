@@ -83,17 +83,19 @@ class SwinEncoder(nn.Module):
             # checkpoint; keep only the vision encoder and drop the text decoder.
             from transformers import VisionEncoderDecoderModel
 
-            # low_cpu_mem_usage=False forces the classic (non-meta) init path:
-            # SwinV2 computes relative_position_index / relative_coords_table as
-            # non-persistent buffers in __init__. Under transformers' meta
-            # fast-init those buffers are created on the meta device and never
-            # materialised (they are absent from the checkpoint), so a later
-            # model.to(device) raises "Cannot copy out of meta tensor".
-            ved = VisionEncoderDecoderModel.from_pretrained(
-                model_name, low_cpu_mem_usage=False
-            )
-            self.model = ved.encoder
-            config = self.model.config
+            ved = VisionEncoderDecoderModel.from_pretrained(model_name)
+            encoder = ved.encoder
+            config = encoder.config
+            # The composite VisionEncoderDecoder loader builds the SwinV2 encoder
+            # on the meta device and does not honour low_cpu_mem_usage=False for
+            # the sub-model, so SwinV2's persistent=False position buffers
+            # (relative_position_index / relative_coords_table) are never
+            # materialised -> a later model.to(device) raises "Cannot copy out of
+            # meta tensor". Rebuild the encoder from its config (real __init__
+            # recomputes those buffers on CPU) and copy the loaded weights over.
+            # persistent=False buffers are absent from state_dict, so only real
+            # parameters move; the recomputed buffers are correct by construction.
+            self.model = self._materialize_from_config(encoder, config)
         elif pretrained:
             # Use the classification wrapper first so supervised fine-tuned
             # checkpoints load completely, then keep only the Swin backbone.
@@ -116,6 +118,29 @@ class SwinEncoder(nn.Module):
         else:
             self.input_size = tuple(image_size)
         self.embed_dim = int(getattr(config, "hidden_size", 768))
+
+    @staticmethod
+    def _materialize_from_config(loaded_model, config):
+        """Return a meta-free copy of ``loaded_model``.
+
+        No-op unless the model carries meta tensors. When it does (the
+        VisionEncoderDecoder composite loader leaves SwinV2's persistent=False
+        position buffers on the meta device), rebuild from ``config`` so those
+        buffers are recomputed on a real device, then copy the already-loaded
+        weights across. Persistent=False buffers are not in ``state_dict``, so
+        only real parameters/persistent buffers move.
+        """
+        from transformers import AutoModel
+
+        has_meta = any(
+            t.is_meta
+            for t in list(loaded_model.parameters()) + list(loaded_model.buffers())
+        )
+        if not has_meta:
+            return loaded_model
+        fresh = AutoModel.from_config(config)
+        fresh.load_state_dict(loaded_model.state_dict(), strict=False)
+        return fresh
 
     def train(self, mode: bool = True):
         super().train(mode)
