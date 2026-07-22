@@ -10,7 +10,7 @@ from typing import Any, Generator, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
-from health_multimodal.common.device import get_module_device
+from ._device import get_module_device
 from timm.models.layers import trunc_normal_
 
 from .resnet import resnet18, resnet50

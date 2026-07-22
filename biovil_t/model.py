@@ -12,7 +12,7 @@ from typing import Any, Optional, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from health_multimodal.common.device import get_module_device
+from ._device import get_module_device
 
 from .encoder import get_encoder_from_type, get_encoder_output_dim, MultiImageEncoder
 from .modules import MLP, MultiTaskModel
