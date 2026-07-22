@@ -192,23 +192,38 @@ def load_kaggle_secrets(secret_names: tuple[str, ...], secret_dir: str | Path) -
 
 
 def discover_dataset(dataset_slug: str, input_root: str | Path = "/kaggle/input") -> Path:
-    """Resolve exactly one shallow mount by slug and required manifest."""
-    input_root = Path(input_root)
+    """Resolve exactly one dataset mount by slug or path, plus its required manifest.
+
+    Handles a flat mount (``/kaggle/input/<slug>``), a nested mount
+    (``/kaggle/input/datasets/<owner>/<slug>``), and a direct absolute path to
+    the dataset directory.
+    """
+    def _has_manifest(directory: Path) -> bool:
+        return (
+            (directory / "dataset_manifest.json").is_file()
+            or (directory / "manifests" / "dataset_manifest.json").is_file()
+        )
+
     slug = dataset_slug.split("/")[-1].strip()
+    direct = Path(dataset_slug)
+    if direct.is_absolute() and direct.is_dir() and _has_manifest(direct):
+        return direct
+
+    input_root = Path(input_root)
     candidates = []
-    for child in input_root.iterdir():
-        if not child.is_dir() or child.name != slug:
-            continue
-        if (child / "dataset_manifest.json").is_file():
-            candidates.append(child)
-        elif (child / "manifests" / "dataset_manifest.json").is_file():
-            candidates.append(child)
-    if len(candidates) != 1:
+    for pattern in (slug, f"*/{slug}", f"*/*/{slug}"):
+        for child in input_root.glob(pattern):
+            if child.is_dir() and _has_manifest(child):
+                candidates.append(child)
+        if candidates:
+            break
+    unique = list(dict.fromkeys(str(c) for c in candidates))
+    if len(unique) != 1:
         raise RuntimeError(
             f"Expected exactly one mounted dataset {slug!r} with a manifest; "
-            f"found {len(candidates)}"
+            f"found {len(unique)}"
         )
-    return candidates[0]
+    return Path(unique[0])
 
 
 def load_dataset_manifest(dataset_root: str | Path) -> tuple[dict, Path, str]:
