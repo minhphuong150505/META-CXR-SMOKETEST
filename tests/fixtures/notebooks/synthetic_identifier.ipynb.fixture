@@ -1,0 +1,43 @@
+{
+ "cells": [
+  {
+   "cell_type": "code",
+   "source": [
+    "df.head()\n"
+   ],
+   "outputs": [
+    {
+     "output_type": "stream",
+     "name": "stdout",
+     "text": [
+      "   subject_id  study_id  Cardiomegaly\n",
+      "0    19999901  59999901           1.0\n",
+      "1    19999902  59999902           0.0\n"
+     ]
+    }
+   ],
+   "execution_count": 3,
+   "metadata": {}
+  },
+  {
+   "cell_type": "code",
+   "source": [
+    "print(path)\n"
+   ],
+   "outputs": [
+    {
+     "output_type": "stream",
+     "name": "stdout",
+     "text": [
+      "files/p19/p19999901/s59999901/x.jpg\n"
+     ]
+    }
+   ],
+   "execution_count": 4,
+   "metadata": {}
+  }
+ ],
+ "metadata": {},
+ "nbformat": 4,
+ "nbformat_minor": 5
+}

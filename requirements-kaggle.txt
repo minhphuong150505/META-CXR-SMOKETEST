@@ -1,0 +1,22 @@
+# Keep Kaggle's preinstalled torch/torchvision/CUDA pair. The notebook verifies
+# it before importing torch into the training process and never replaces it.
+numpy==1.26.4
+pandas==2.2.3
+Pillow==10.4.0
+PyYAML==6.0.2
+tqdm==4.67.1
+transformers==4.53.2
+tokenizers==0.21.4
+huggingface-hub==0.33.4
+omegaconf==2.3.0
+iopath==0.1.10
+timm==0.9.16
+scikit-image==0.24.0
+torchinfo==1.8.0
+wandb==0.18.7
+hi-ml-multimodal==0.2.1
+einops==0.8.0
+fairscale==0.4.13
+kaggle==2.2.3
+kagglehub==1.0.2
+nbformat>=5.10,<6
