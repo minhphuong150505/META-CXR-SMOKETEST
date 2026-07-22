@@ -2,12 +2,14 @@ import json
 from pathlib import Path
 
 import pytest
+import yaml
 
 from smoke.runtime import (
     assert_session_eta,
     discover_dataset,
     load_dataset_manifest,
     sha256_file,
+    write_runtime_env_config,
 )
 
 
@@ -31,6 +33,30 @@ def test_load_manifest_returns_exact_file_hash(tmp_path):
     assert payload["status"] == "qa_passed"
     assert resolved == path
     assert digest == sha256_file(path)
+
+
+@pytest.mark.parametrize(
+    "mounted_name",
+    ["mimic-cxr-2.0.0-chexpert-subset.csv.gz", "mimic-cxr-2.0.0-chexpert-subset.csv"],
+)
+def test_env_config_resolves_chexpert_csv_with_or_without_gz(
+    tmp_path, monkeypatch, mounted_name
+):
+    dataset = tmp_path / "dataset"
+    dataset.mkdir()
+    (dataset / mounted_name).write_bytes(b"stub")
+    monkeypatch.chdir(tmp_path)
+    path = write_runtime_env_config(dataset, tmp_path / "out")
+    paths = yaml.safe_load(path.read_text(encoding="utf-8"))["paths"]
+    assert paths["chexpert_csv"] == str(dataset.resolve() / mounted_name)
+
+
+def test_env_config_fails_fast_when_chexpert_csv_absent(tmp_path, monkeypatch):
+    dataset = tmp_path / "dataset"
+    dataset.mkdir()
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(FileNotFoundError, match="chexpert-subset"):
+        write_runtime_env_config(dataset, tmp_path / "out")
 
 
 def test_eta_guard_reserves_upload_window():
