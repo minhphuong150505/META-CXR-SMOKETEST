@@ -21,6 +21,7 @@ from model.lavis.common.dist_utils import (
     download_cached_file,
     get_rank,
     get_world_size,
+    is_dist_avail_and_initialized,
     is_main_process,
     main_process,
 )
@@ -497,16 +498,30 @@ class RunnerBase:
         output_dir = base_dir if base_dir.name == self.run_name else base_dir / self.run_name
         if self.evaluate_only:
             output_dir = base_dir / self.run_name.replace("_eval", "")
-        elif output_dir.exists() and any(output_dir.iterdir()):
-            if not self.resume_ckpt_path:
+        result_dir = output_dir / "result"
+
+        # DDP-safe: only the main process runs the "refuse to overwrite" check
+        # and creates the directories, then the other ranks wait on a barrier.
+        # If every rank did this, a slower rank would see the directory the
+        # faster rank just created (via the mkdir below) as non-empty and raise
+        # a spurious FileExistsError -- the race that made exactly one of the two
+        # ranks fail on every launch, regardless of whether the dir was clean.
+        if is_main_process():
+            if (
+                not self.evaluate_only
+                and output_dir.exists()
+                and any(output_dir.iterdir())
+                and not self.resume_ckpt_path
+            ):
                 raise FileExistsError(
                     f"Refusing to overwrite non-empty run directory {output_dir}; "
                     "set run.resume_ckpt_path to resume this exact run."
                 )
-        result_dir = output_dir / "result"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            result_dir.mkdir(parents=True, exist_ok=True)
 
-        output_dir.mkdir(parents=True, exist_ok=True)
-        result_dir.mkdir(parents=True, exist_ok=True)
+        if is_dist_avail_and_initialized():
+            dist.barrier()
 
         registry.register_path("result_dir", str(result_dir))
         registry.register_path("output_dir", str(output_dir))
