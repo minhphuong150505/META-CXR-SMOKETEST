@@ -162,6 +162,23 @@ def main():
             )
 
     model = task.build_model(cfg)
+
+    # TEMP DIAGNOSTIC: name the tensors still on the meta device before the
+    # model-wide .to(device), so we stop guessing which submodule leaks them.
+    _meta = [
+        n for n, t in
+        (list(model.named_parameters()) + list(model.named_buffers()))
+        if getattr(t, "is_meta", False)
+    ]
+    if _meta:
+        print(f"[META-DIAG] {len(_meta)} meta tensors after build_model:", flush=True)
+        for _n in _meta:
+            print(f"[META-DIAG]   {_n}", flush=True)
+        raise RuntimeError(
+            f"{len(_meta)} tensors are on the meta device after build_model; "
+            f"first: {_meta[:8]}"
+        )
+
     runner = RunnerBase(
         cfg=cfg, job_id=job_id, task=task, model=model, datasets=datasets
     )
