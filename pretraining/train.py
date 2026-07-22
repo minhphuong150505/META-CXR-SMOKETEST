@@ -163,20 +163,17 @@ def main():
 
     model = task.build_model(cfg)
 
-    # TEMP DIAGNOSTIC: name the tensors still on the meta device before the
-    # model-wide .to(device), so we stop guessing which submodule leaks them.
+    # Fail fast, by name, if any tensor is still on the meta device: the
+    # model-wide .to(device) would otherwise raise the opaque "Cannot copy out
+    # of meta tensor". Names make the leaking submodule obvious.
     _meta = [
         n for n, t in
         (list(model.named_parameters()) + list(model.named_buffers()))
         if getattr(t, "is_meta", False)
     ]
     if _meta:
-        print(f"[META-DIAG] {len(_meta)} meta tensors after build_model:", flush=True)
-        for _n in _meta:
-            print(f"[META-DIAG]   {_n}", flush=True)
         raise RuntimeError(
-            f"{len(_meta)} tensors are on the meta device after build_model; "
-            f"first: {_meta[:8]}"
+            f"{len(_meta)} tensor(s) on the meta device after build_model: {_meta}"
         )
 
     runner = RunnerBase(

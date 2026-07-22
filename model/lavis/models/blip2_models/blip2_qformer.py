@@ -136,6 +136,18 @@ class Blip2Qformer(Blip2Base):
             num_query_token, vis_num_feat, cross_attention_freq
         )
         self.Qformer.resize_token_embeddings(len(self.tokenizer))
+        # BertLMPredictionHead aliases decoder.bias to cls.predictions.bias.
+        # Under transformers' meta fast-init, resize_token_embeddings rebuilds
+        # cls.predictions.bias as a real tensor but drops that alias, stranding
+        # decoder.bias on the meta device -> a later model.to(device) raises
+        # "Cannot copy out of meta tensor". Restore the alias to the real bias.
+        _pred = getattr(getattr(self.Qformer, "cls", None), "predictions", None)
+        if (
+            _pred is not None
+            and getattr(getattr(_pred, "decoder", None), "bias", None) is not None
+            and _pred.decoder.bias.is_meta
+        ):
+            _pred.decoder.bias = _pred.bias
         state_dict = self.Qformer.state_dict()
         for name, param in self.Qformer.named_parameters():
             if "_query" in name:
