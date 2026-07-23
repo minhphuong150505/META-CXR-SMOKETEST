@@ -111,37 +111,49 @@ def _gcs_client():
 
 
 def upload_checkpoint_gcs(bucket_name: str, prefix: str, run_dir: str | Path) -> str:
-    """Upload every file under run_dir to gs://bucket_name/prefix/. Checkpoints are
-    too large for Kaggle's private dataset quota. Verifies the manifest round-trips."""
+    """Upload only checkpoint_last.pth, checkpoint_best.pth and log.txt to
+    gs://bucket_name/prefix/, overwriting the prior session's copies.
+
+    checkpoint_best.pth is optional: a resumed session that never beats the
+    carried-forward best produces none locally, and the best already on GCS
+    stays authoritative. Each uploaded blob's size is verified against the
+    local file to catch a truncated upload without re-downloading the weights.
+    """
     run_dir = Path(run_dir)
-    manifest = run_dir / "artifact_manifest.json"
-    if not manifest.is_file():
-        raise FileNotFoundError("artifact_manifest.json must be written before upload")
+    required = ("checkpoint_last.pth", "log.txt")
+    optional = ("checkpoint_best.pth",)
     bucket = _gcs_client().bucket(bucket_name)
-    for f in sorted(run_dir.rglob("*")):
-        if f.is_file():
-            bucket.blob(f"{prefix}/{f.relative_to(run_dir).as_posix()}").upload_from_filename(str(f))
-    import os, tempfile
-    tmp = Path(tempfile.mkdtemp()) / "artifact_manifest.json"
-    bucket.blob(f"{prefix}/artifact_manifest.json").download_to_filename(str(tmp))
-    ok = sha256_file(tmp) == sha256_file(manifest)
-    os.remove(tmp)
-    if not ok:
-        raise RuntimeError("Uploaded artifact_manifest.json failed SHA-256 verification")
+    for name in required + optional:
+        f = run_dir / name
+        if not f.is_file():
+            if name in required:
+                raise FileNotFoundError(f"Required upload artifact is missing: {f}")
+            continue
+        blob = bucket.blob(f"{prefix}/{name}")
+        blob.upload_from_filename(str(f))
+        blob.reload()
+        local_size = f.stat().st_size
+        if blob.size != local_size:
+            raise RuntimeError(
+                f"Uploaded {name} size mismatch ({blob.size} != {local_size})"
+            )
     return f"gs://{bucket_name}/{prefix}/"
 
 
-def download_checkpoint_gcs(bucket_name: str, prefix: str, names, dest: str | Path) -> dict:
-    """Download the named files from gs://bucket_name/prefix/ into dest."""
+def download_last_checkpoint(bucket_name: str, prefix: str, dest: str | Path):
+    """Download only checkpoint_last.pth from gs://bucket_name/prefix/ into dest.
+
+    Returns the local Path to resume from, or None when no checkpoint exists yet
+    (a fresh experiment, so training starts from epoch 0). checkpoint_best.pth is
+    never pulled: resuming needs only the last state, and best-tracking is
+    restored from fields carried inside checkpoint_last.pth.
+    """
     dest = Path(dest)
-    dest.mkdir(parents=True, exist_ok=True)
     bucket = _gcs_client().bucket(bucket_name)
-    out = {}
-    for name in names:
-        blob = bucket.blob(f"{prefix}/{name}")
-        if not blob.exists():
-            raise FileNotFoundError(f"gs://{bucket_name}/{prefix}/{name}")
-        local = dest / name
-        blob.download_to_filename(str(local))
-        out[name] = local
-    return out
+    blob = bucket.blob(f"{prefix}/checkpoint_last.pth")
+    if not blob.exists():
+        return None
+    dest.mkdir(parents=True, exist_ok=True)
+    local = dest / "checkpoint_last.pth"
+    blob.download_to_filename(str(local))
+    return local
