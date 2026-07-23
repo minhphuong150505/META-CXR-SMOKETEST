@@ -61,8 +61,12 @@ def setup_seeds(config):
     np.random.seed(seed)
     torch.manual_seed(seed)
 
-    cudnn.benchmark = False
-    cudnn.deterministic = True
+    # benchmark autotunes cuDNN conv kernels for the fixed 448x448 input -- a
+    # real throughput win on the conv-heavy frozen encoders. It gives up exact
+    # bit-reproducibility of the loss curve, which resume identity does not
+    # depend on (that gates on dataset + config, not RNG-level determinism).
+    cudnn.benchmark = True
+    cudnn.deterministic = False
 
 
 def get_runner_class(cfg):
