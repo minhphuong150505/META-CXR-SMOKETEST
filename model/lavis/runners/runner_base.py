@@ -1021,6 +1021,10 @@ class RunnerBase:
             "model": state_dict,
             "config": self.config.to_dict(),
             "identity": self._checkpoint_identity(),
+            # Provenance only: records which commit produced the weights, but is
+            # NOT part of the resume identity check, so a plumbing-only commit
+            # does not strand the checkpoint.
+            "source_commit": self.config.run_cfg.get("source_commit"),
             "epoch": cur_epoch,
             "best_agg_metric": best_agg_metric,
             "best_epoch": best_epoch,
