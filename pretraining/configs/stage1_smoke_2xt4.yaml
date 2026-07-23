@@ -71,11 +71,11 @@ run:
   max_epoch: 1
   scheduler_max_epoch: 10
   save_freq: 0
-  batch_size_train: 1
+  batch_size_train: 4
   batch_size_eval: 2
   num_workers: 4
   warmup_steps: 1
-  accum_grad_iters: 64
+  accum_grad_iters: 16
   max_grad_norm: 1.0
   # Required: view_fusion is skipped for studies with no auxiliary view, and the
   # lambda_mpc=0 / lambda_view_consistency=0 terms leave their params without
