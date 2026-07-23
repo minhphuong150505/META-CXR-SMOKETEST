@@ -77,7 +77,16 @@ class Blip2Base(BaseModel):
             pass
 
         elif model_name == "biovil":
-            biovilt_checkpoint_path = _download_biovil_t_image_model_weights()
+            # torchvision's download_url writes straight to the final path, so
+            # concurrent ranks corrupt each other's download. Rank 0 downloads
+            # first; the others re-call after the barrier and hit the
+            # md5-verified cached file instead of re-downloading.
+            if dist_utils.is_main_process():
+                biovilt_checkpoint_path = _download_biovil_t_image_model_weights()
+            if dist_utils.is_dist_avail_and_initialized():
+                dist.barrier()
+            if not dist_utils.is_main_process():
+                biovilt_checkpoint_path = _download_biovil_t_image_model_weights()
             model_type = ImageEncoderType.RESNET50_MULTI_IMAGE
             visual_encoder = ImageModel(img_encoder_type=model_type,
                                      joint_feature_size=1408,
