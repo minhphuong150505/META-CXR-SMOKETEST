@@ -110,9 +110,9 @@ def _gcs_client():
     return storage.Client()
 
 
-def upload_checkpoint_gcs(bucket_name: str, prefix: str, run_dir: str | Path) -> str:
-    """Upload only checkpoint_last.pth, checkpoint_best.pth and log.txt to
-    gs://bucket_name/prefix/, overwriting the prior session's copies.
+def upload_checkpoint_gcs(bucket_name: str, run_dir: str | Path) -> str:
+    """Upload only checkpoint_last.pth, checkpoint_best.pth and log.txt to the
+    bucket root (gs://bucket_name/), overwriting the prior session's copies.
 
     checkpoint_best.pth is optional: a resumed session that never beats the
     carried-forward best produces none locally, and the best already on GCS
@@ -129,7 +129,7 @@ def upload_checkpoint_gcs(bucket_name: str, prefix: str, run_dir: str | Path) ->
             if name in required:
                 raise FileNotFoundError(f"Required upload artifact is missing: {f}")
             continue
-        blob = bucket.blob(f"{prefix}/{name}")
+        blob = bucket.blob(name)
         blob.upload_from_filename(str(f))
         blob.reload()
         local_size = f.stat().st_size
@@ -137,11 +137,12 @@ def upload_checkpoint_gcs(bucket_name: str, prefix: str, run_dir: str | Path) ->
             raise RuntimeError(
                 f"Uploaded {name} size mismatch ({blob.size} != {local_size})"
             )
-    return f"gs://{bucket_name}/{prefix}/"
+    return f"gs://{bucket_name}/"
 
 
-def download_last_checkpoint(bucket_name: str, prefix: str, dest: str | Path):
-    """Download only checkpoint_last.pth from gs://bucket_name/prefix/ into dest.
+def download_last_checkpoint(bucket_name: str, dest: str | Path):
+    """Download only checkpoint_last.pth from the bucket root (gs://bucket_name/)
+    into dest.
 
     Returns the local Path to resume from, or None when no checkpoint exists yet
     (a fresh experiment, so training starts from epoch 0). checkpoint_best.pth is
@@ -150,7 +151,7 @@ def download_last_checkpoint(bucket_name: str, prefix: str, dest: str | Path):
     """
     dest = Path(dest)
     bucket = _gcs_client().bucket(bucket_name)
-    blob = bucket.blob(f"{prefix}/checkpoint_last.pth")
+    blob = bucket.blob("checkpoint_last.pth")
     if not blob.exists():
         return None
     dest.mkdir(parents=True, exist_ok=True)
