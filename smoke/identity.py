@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 
+# Fields that gate resume: if any differs, the checkpoint was trained on a
+# different dataset or a different scientific configuration and must NOT be
+# resumed. The git commit is deliberately NOT here -- a plumbing/code-only
+# commit that leaves the dataset and training config unchanged must still
+# resume. source_commit travels with the checkpoint as provenance only.
 IDENTITY_FIELDS = (
-    "source_commit",
     "dataset_manifest_sha256",
     "config_fingerprint",
 )
