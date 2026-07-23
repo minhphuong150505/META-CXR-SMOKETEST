@@ -20,4 +20,5 @@ einops==0.8.0
 fairscale==0.4.13
 kaggle==2.2.3
 kagglehub==1.0.2
+google-cloud-storage
 nbformat>=5.10,<6
