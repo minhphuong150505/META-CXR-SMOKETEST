@@ -1,8 +1,10 @@
-# Keep Kaggle's preinstalled torch/torchvision/CUDA pair. The notebook verifies
-# it before importing torch into the training process and never replaces it.
-numpy==1.26.4
-pandas==2.2.3
-Pillow==10.4.0
+# Keep Kaggle's preinstalled scientific/torch stack: torch, torchvision, CUDA,
+# and also numpy / pandas / Pillow. Pinning numpy/pandas/Pillow to different
+# versions forces downgrades that fight Kaggle's torch build and cause a
+# numpy 1.x/2.x pickle mismatch between the training subprocess (which loads the
+# pinned version from disk) and this kernel (which already holds Kaggle's numpy
+# in memory via torch), breaking checkpoint save/load. Let Kaggle's versions
+# stand; only install what Kaggle lacks or where the code needs a specific pin.
 PyYAML==6.0.2
 tqdm==4.67.1
 transformers==4.53.2

@@ -33,12 +33,9 @@ FINGERPRINT_PACKAGES = (
 REQUIRED_KAGGLE_PACKAGES = {
     "transformers": "4.53.2",
     "tokenizers": "0.21.4",
-    "numpy": "1.26.4",
-    "pandas": "2.2.3",
     "timm": "0.9.16",
     "omegaconf": "2.3.0",
     "hi-ml-multimodal": "0.2.1",
-    "Pillow": "10.4.0",
     "wandb": "0.18.7",
     "kaggle": "2.2.3",
     "kagglehub": "1.0.2",
