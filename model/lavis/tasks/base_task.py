@@ -114,6 +114,7 @@ class BaseTask:
         log_freq=50,
         accum_grad_iters=1,
         max_grad_norm=1.0,
+        run_role="train",
     ):
         return self._train_inner_loop(
             epoch=epoch,
@@ -127,6 +128,7 @@ class BaseTask:
             cuda_enabled=cuda_enabled,
             accum_grad_iters=accum_grad_iters,
             max_grad_norm=max_grad_norm,
+            run_role=run_role,
         )
 
     def train_iters(
@@ -143,6 +145,7 @@ class BaseTask:
         log_freq=50,
         accum_grad_iters=1,
         max_grad_norm=1.0,
+        run_role="train",
     ):
         return self._train_inner_loop(
             epoch=epoch,
@@ -157,6 +160,7 @@ class BaseTask:
             cuda_enabled=cuda_enabled,
             accum_grad_iters=accum_grad_iters,
             max_grad_norm=max_grad_norm,
+            run_role=run_role,
         )
 
     def _train_inner_loop(
@@ -173,6 +177,7 @@ class BaseTask:
         cuda_enabled=False,
         accum_grad_iters=1,
         max_grad_norm=1.0,
+        run_role="train",
     ):
         """
         An inner training loop compatible with both epoch-based and iter-based training.
@@ -200,7 +205,10 @@ class BaseTask:
                 epoch, iters_per_epoch
             )
         )
-        header = "Train: data epoch: [{}]".format(epoch)
+        # Role prefix ("[preflight]" vs "[train]") so the 2-step preflight probe,
+        # which always runs a fresh epoch 0, is never mistaken in the logs for
+        # the real run restarting at epoch 0 after a resume.
+        header = "[{}] Train: data epoch: [{}]".format(run_role, epoch)
         if start_iters is None:
             # epoch-based runner
             inner_epoch = epoch
