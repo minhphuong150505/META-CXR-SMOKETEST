@@ -1167,11 +1167,26 @@ class RunnerBase:
         if not isinstance(rng_by_rank, list) or rank >= len(rng_by_rank):
             raise RuntimeError("Resume checkpoint is missing rank-specific RNG state")
         rng = rng_by_rank[rank]
-        random.setstate(rng["python"])
-        np.random.set_state(rng["numpy"])
-        torch.set_rng_state(rng["torch"])
-        if torch.cuda.is_available() and rng.get("cuda"):
-            torch.cuda.set_rng_state_all(rng["cuda"])
+        # RNG restore is best-effort. Resume identity gates on dataset + config,
+        # not RNG-level determinism (cudnn.benchmark is on, deterministic off),
+        # so a state that will not round-trip on this torch build must not abort
+        # the resume -- warn and continue with fresh RNG, like the scaler path
+        # above. torch.set_rng_state needs a CPU uint8 ByteTensor.
+        try:
+            random.setstate(rng["python"])
+            np.random.set_state(rng["numpy"])
+            torch_rng = rng["torch"]
+            if torch.is_tensor(torch_rng):
+                torch_rng = torch_rng.cpu().to(torch.uint8)
+            torch.set_rng_state(torch_rng)
+            if torch.cuda.is_available() and rng.get("cuda"):
+                torch.cuda.set_rng_state_all(rng["cuda"])
+        except (TypeError, RuntimeError, ValueError, KeyError) as exc:
+            logging.warning(
+                "Could not restore saved RNG state (%s: %s); continuing with "
+                "fresh RNG. Resume identity does not depend on it.",
+                type(exc).__name__, exc,
+            )
 
         self.start_epoch = checkpoint["epoch"] + 1
         # Restore best-tracking so resumed runs don't overwrite checkpoint_best.pth
