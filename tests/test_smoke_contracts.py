@@ -32,13 +32,24 @@ def test_sensitivity_matrix_has_seven_predeclared_masks():
 
 def test_resume_contract_keeps_rng_and_explicit_sampler_epoch():
     runner = (ROOT / "model/lavis/runners/runner_base.py").read_text()
+    resume = (ROOT / "smoke/resume.py").read_text()
     loader = (
         ROOT / "model/lavis/datasets/datasets/dataloader_utils.py"
     ).read_text()
+    # Runner persists per-rank RNG and delegates capture/restore to the shared
+    # helper, and MUST load the checkpoint on CPU so the RNG ByteTensors stay
+    # restorable (map_location=cuda was the source of the ByteTensor failure).
     assert '"rng_by_rank"' in runner
-    assert "random.setstate" in runner
-    assert "np.random.set_state" in runner
-    assert "torch.set_rng_state" in runner
+    assert "capture_rng_state" in runner
+    assert "restore_rng_state" in runner
+    assert 'map_location="cpu"' in runner
+    assert "map_location=self.device" not in runner
+    # The actual RNG restore lives in smoke/resume.py, coercing to CPU ByteTensor.
+    assert "random.setstate" in resume
+    assert "np.random.set_state" in resume
+    assert "torch.set_rng_state" in resume
+    assert "torch.cuda.set_rng_state_all" in resume
+    # Data-order continuity: the sampler epoch is set explicitly per runner epoch.
     assert "def set_epoch" in loader
     assert "sampler.set_epoch" in loader
 

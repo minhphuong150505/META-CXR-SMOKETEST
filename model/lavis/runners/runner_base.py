@@ -8,12 +8,11 @@
 import datetime
 import json
 import logging
+import math
 import os
-import random
 import time
 from pathlib import Path
 
-import numpy as np
 import torch
 import torch.distributed as dist
 import wandb
@@ -39,6 +38,13 @@ from torch.utils.data.dataset import ChainDataset
 
 from torchinfo import summary
 from smoke.identity import assert_checkpoint_identity, build_checkpoint_identity
+from smoke.resume import (
+    CHECKPOINT_VERSION,
+    capture_rng_state,
+    resolve_next_epoch,
+    restore_rng_state,
+    scaler_state_health,
+)
 from smoke.samplers import DistributedEvalSampler
 
 
@@ -65,28 +71,6 @@ def _state_dict_has_non_finite(state_dict):
 
     walk(state_dict)
     return bad > 0, bad
-
-
-def _scaler_state_is_degenerate(scaler_state):
-    """Detect a GradScaler state that has degraded to scale<=0 (training-dead).
-
-    After enough consecutive AMP overflows, scale halves down to fp32 underflow
-    and becomes exactly 0. From that point: loss*0=0, grad=0, then unscale_
-    divides by 0 producing NaN — every step is skipped forever. Loading such a
-    scaler state poisons the resumed run even though no tensor is NaN/Inf.
-    """
-    if not isinstance(scaler_state, dict):
-        return False, None
-    scale = scaler_state.get("scale")
-    if scale is None:
-        return False, None
-    try:
-        scale_val = scale.item() if isinstance(scale, torch.Tensor) else float(scale)
-    except (TypeError, ValueError):
-        return False, None
-    if not (scale_val > 0):
-        return True, scale_val
-    return False, scale_val
 
 
 @registry.register_runner("runner_base")
@@ -449,6 +433,13 @@ class RunnerBase:
         return self.config.run_cfg.get("resume_ckpt_path", None)
 
     @property
+    def run_role(self):
+        # "preflight" for the 2-step DDP smoke probe, "train" for the real run.
+        # Purely a logging label so preflight's fresh epoch-0 pass is never
+        # mistaken for the real run restarting from epoch 0.
+        return str(self.config.run_cfg.get("run_role", "train"))
+
+    @property
     def save_freq(self):
         return int(self.config.run_cfg.get("save_freq", 1))
 
@@ -720,6 +711,26 @@ class RunnerBase:
             if resumed_epoch is not None:
                 best_epoch = resumed_epoch
 
+        # Unambiguous banner: names the role (preflight vs real train) and the
+        # first epoch this process will actually run, so a resumed run showing
+        # "data epoch: [1]" is never confused with a fresh preflight at [0].
+        if self.start_epoch >= self.max_epoch:
+            logging.warning(
+                "[%s] run_name=%s: start_epoch=%d >= max_epoch=%d — nothing to "
+                "train; the requested epochs are already complete in the resume "
+                "checkpoint.",
+                self.run_role, self.run_name, self.start_epoch, self.max_epoch,
+            )
+        logging.info(
+            "===== [%s] TRAINING LOOP START | run_name=%s | resume=%s | "
+            "first_epoch_to_run=%d | max_epoch=%d =====",
+            self.run_role,
+            self.run_name,
+            "yes" if self.resume_ckpt_path is not None else "no",
+            self.start_epoch,
+            self.max_epoch,
+        )
+
         for cur_epoch in range(self.start_epoch, self.max_epoch):
             if hasattr(self.train_loader, "set_epoch"):
                 self.train_loader.set_epoch(cur_epoch)
@@ -831,6 +842,7 @@ class RunnerBase:
             log_freq=self.log_freq,
             accum_grad_iters=self.accum_grad_iters,
             max_grad_norm=self.max_grad_norm,
+            run_role=self.run_role,
         )
 
     @torch.no_grad()
@@ -989,12 +1001,10 @@ class RunnerBase:
         optimizer_state = self.optimizer.state_dict() if include_training_state else None
         rng_state = None
         if include_training_state:
-            local_rng = {
-                "python": random.getstate(),
-                "numpy": np.random.get_state(),
-                "torch": torch.get_rng_state(),
-                "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
-            }
+            # Snapshot every rank's RNG (all_gather_object is a collective, so it
+            # must run on every rank before the main-process early-return below),
+            # then index by rank on resume. This keeps each rank's RNG its own.
+            local_rng = capture_rng_state()
             if dist.is_available() and dist.is_initialized():
                 rng_state = [None] * get_world_size()
                 dist.all_gather_object(rng_state, local_rng)
@@ -1032,16 +1042,69 @@ class RunnerBase:
             # NOT part of the resume identity check, so a plumbing-only commit
             # does not strand the checkpoint.
             "source_commit": self.config.run_cfg.get("source_commit"),
+            "checkpoint_version": CHECKPOINT_VERSION,
+            # `epoch` is the LAST COMPLETED epoch (unchanged v1 meaning);
+            # `next_epoch` is the first epoch a resume must run. Making both
+            # explicit removes the "is epoch 0 done or pending?" ambiguity.
             "epoch": cur_epoch,
+            "next_epoch": cur_epoch + 1,
             "best_agg_metric": best_agg_metric,
             "best_epoch": best_epoch,
         }
+        scaler_healthy = None
         if include_training_state:
             save_obj["optimizer"] = optimizer_state
-            save_obj["scaler"] = self.scaler.state_dict() if self.scaler else None
+            scaler_state = self.scaler.state_dict() if self.scaler else None
+            if scaler_state is not None:
+                status, scale_val = scaler_state_health(scaler_state)
+                scaler_healthy = status == "healthy"
+                if not scaler_healthy:
+                    # A degenerate/non-finite scaler means AMP collapsed this
+                    # epoch (repeated fp16 overflow drove scale->0), so the
+                    # optimizer barely advanced. Persist a FRESH scaler instead
+                    # of a dead one so the resume anchor stays usable, and flag
+                    # it loudly rather than silently shipping scale=0.
+                    logging.error(
+                        "GradScaler is %s at save time (scale=%s): AMP has "
+                        "collapsed from repeated fp16 gradient overflow. Saving a "
+                        "reset scaler so resume can recover; investigate fp16 "
+                        "stability (loss scale / encoder output magnitudes).",
+                        status, scale_val,
+                    )
+                    scaler_state = self._fresh_scaler_state()
+            save_obj["scaler"] = scaler_state
+            save_obj["scaler_healthy"] = scaler_healthy
             save_obj["rng_by_rank"] = rng_state
-        logging.info("Saving checkpoint at epoch {} to {}.".format(cur_epoch, save_to))
+            # Observability only (the stateless scheduler recomputes LR from the
+            # epoch, so resume does not depend on these counters).
+            try:
+                steps_per_epoch = math.ceil(
+                    len(self.train_loader) / max(self.accum_grad_iters, 1)
+                )
+                save_obj["optimizer_steps_per_epoch"] = steps_per_epoch
+                save_obj["global_optimizer_step"] = (cur_epoch + 1) * steps_per_epoch
+            except TypeError:
+                pass
+        logging.info(
+            "Saving checkpoint | version=%d | role=%s | completed_epoch=%d | "
+            "next_epoch=%d | scaler_healthy=%s | global_step=%s | path=%s",
+            CHECKPOINT_VERSION,
+            self.run_role,
+            cur_epoch,
+            cur_epoch + 1,
+            scaler_healthy,
+            save_obj.get("global_optimizer_step"),
+            save_to,
+        )
         torch.save(save_obj, save_to)
+
+    def _fresh_scaler_state(self):
+        """A pristine GradScaler state_dict, matching the runner's scaler ctor."""
+        try:
+            fresh = torch.amp.GradScaler("cuda")
+        except (AttributeError, TypeError):
+            fresh = torch.cuda.amp.GradScaler()
+        return fresh.state_dict()
 
     def _reload_best_model(self, model):
         """
@@ -1061,16 +1124,32 @@ class RunnerBase:
     def _load_checkpoint(self, url_or_filename):
         """
         Resume from a checkpoint.
+
+        Every rank loads the checkpoint independently and indexes its own RNG
+        slice; barriers fence the load so no rank starts training on a
+        half-restored optimizer/scaler/RNG while another is still reading.
         """
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier()
+        # map_location="cpu" (not the CUDA device): the RNG ByteTensors inside
+        # the checkpoint must land on CPU, because torch.set_rng_state /
+        # torch.cuda.set_rng_state_all reject non-CPU tensors with
+        # "RNG state must be a torch.ByteTensor". Optimizer/model state is
+        # re-homed onto the right device by load_state_dict, so CPU load is safe.
         if is_url(url_or_filename):
             cached_file = download_cached_file(
                 url_or_filename, check_hash=False, progress=True
             )
-            checkpoint = torch.load(cached_file, map_location=self.device, weights_only=False)
+            checkpoint = torch.load(cached_file, map_location="cpu", weights_only=False)
         elif os.path.isfile(url_or_filename):
-            checkpoint = torch.load(url_or_filename, map_location=self.device, weights_only=False)
+            checkpoint = torch.load(url_or_filename, map_location="cpu", weights_only=False)
         else:
             raise RuntimeError("checkpoint url or path is invalid")
+
+        # Accumulates any state that could NOT be restored faithfully, so the
+        # end-of-load banner can honestly report FULL vs PARTIAL resume instead
+        # of pretending everything came back.
+        resume_partial_reasons = []
 
         state_dict = checkpoint["model"]
         expected_identity = self._checkpoint_identity()
@@ -1131,6 +1210,7 @@ class RunnerBase:
         optimizer_state = checkpoint.get("optimizer")
         if optimizer_state is None:
             logging.warning("Optimizer state missing from checkpoint; optimizer will be re-initialized.")
+            resume_partial_reasons.append("optimizer(missing)")
         else:
             opt_bad, opt_bad_count = _state_dict_has_non_finite(optimizer_state)
             if opt_bad:
@@ -1138,6 +1218,7 @@ class RunnerBase:
                     f"Optimizer state contains {opt_bad_count} non-finite tensor(s) — "
                     "skipping load. Optimizer will be re-initialized."
                 )
+                resume_partial_reasons.append("optimizer(nonfinite)")
             else:
                 try:
                     optimizer.load_state_dict(optimizer_state)
@@ -1146,58 +1227,91 @@ class RunnerBase:
                         "Optimizer state is incompatible with this exact run"
                     ) from exc
 
-        if self.scaler and "scaler" in checkpoint and checkpoint["scaler"] is not None:
-            scaler_bad, scaler_bad_count = _state_dict_has_non_finite(checkpoint["scaler"])
-            scaler_dead, scaler_scale = _scaler_state_is_degenerate(checkpoint["scaler"])
-            if scaler_bad:
-                logging.warning(
-                    f"Scaler state contains {scaler_bad_count} non-finite tensor(s) — "
-                    "skipping load. GradScaler will start fresh."
-                )
-            elif scaler_dead:
-                logging.warning(
-                    f"Scaler state has degenerate scale={scaler_scale} — "
-                    "skipping load. GradScaler will start fresh."
-                )
+        scaler_status = "n/a"
+        if self.scaler is not None:
+            scaler_state = checkpoint.get("scaler")
+            # Old (v1) checkpoints have no scaler_healthy flag; assume healthy so
+            # a valid pre-v2 scaler still loads. v2 refuses to persist a dead
+            # scaler, so scaler_healthy=False means "was reset at save time".
+            saved_healthy = checkpoint.get("scaler_healthy", True)
+            scaler_status, scaler_scale = scaler_state_health(scaler_state)
+            if scaler_status == "healthy" and saved_healthy:
+                self.scaler.load_state_dict(scaler_state)
             else:
-                self.scaler.load_state_dict(checkpoint["scaler"])
+                logging.warning(
+                    "GradScaler NOT restored (state=%s, saved_healthy=%s, "
+                    "scale=%s); AMP starts from a fresh scale. This is a PARTIAL "
+                    "resume for the scaler only — model/optimizer/RNG continuity "
+                    "is unaffected. A degenerate scaler indicates prior fp16 "
+                    "overflow, not a resume bug.",
+                    scaler_status, saved_healthy, scaler_scale,
+                )
+                resume_partial_reasons.append(f"scaler({scaler_status})")
 
+        # Each rank restores its OWN saved RNG slice (rank 0's state must not
+        # leak onto rank 1). restore_rng_state coerces the tensors back to CPU
+        # ByteTensors, so the "RNG state must be a torch.ByteTensor" failure from
+        # the old map_location=cuda path cannot recur.
         rng_by_rank = checkpoint.get("rng_by_rank")
         rank = get_rank()
         if not isinstance(rng_by_rank, list) or rank >= len(rng_by_rank):
             raise RuntimeError("Resume checkpoint is missing rank-specific RNG state")
-        rng = rng_by_rank[rank]
-        # RNG restore is best-effort. Resume identity gates on dataset + config,
-        # not RNG-level determinism (cudnn.benchmark is on, deterministic off),
-        # so a state that will not round-trip on this torch build must not abort
-        # the resume -- warn and continue with fresh RNG, like the scaler path
-        # above. torch.set_rng_state needs a CPU uint8 ByteTensor.
         try:
-            random.setstate(rng["python"])
-            np.random.set_state(rng["numpy"])
-            torch_rng = rng["torch"]
-            if torch.is_tensor(torch_rng):
-                torch_rng = torch_rng.cpu().to(torch.uint8)
-            torch.set_rng_state(torch_rng)
-            if torch.cuda.is_available() and rng.get("cuda"):
-                torch.cuda.set_rng_state_all(rng["cuda"])
-        except (TypeError, RuntimeError, ValueError, KeyError) as exc:
+            restored = restore_rng_state(rng_by_rank[rank])
+        except (TypeError, KeyError) as exc:
+            # Structurally invalid RNG dict is a real bug, not a "resume anyway"
+            # situation -- surface it instead of silently reseeding.
+            raise RuntimeError(
+                f"Rank {rank} RNG state in the checkpoint is malformed: {exc}"
+            ) from exc
+        rng_failed = sorted(name for name, ok in restored.items() if not ok)
+        if rng_failed:
             logging.warning(
-                "Could not restore saved RNG state (%s: %s); continuing with "
-                "fresh RNG. Resume identity does not depend on it.",
-                type(exc).__name__, exc,
+                "Rank %d: RNG streams NOT restored: %s (restored: %s). Those "
+                "streams continue from a fresh seed — PARTIAL resume.",
+                rank, rng_failed, sorted(n for n, ok in restored.items() if ok),
+            )
+            resume_partial_reasons.append(f"rng[rank{rank}]:{'+'.join(rng_failed)}")
+        else:
+            logging.info(
+                "Rank %d: all RNG streams (python/numpy/torch/cuda) restored.",
+                rank,
             )
 
-        self.start_epoch = checkpoint["epoch"] + 1
+        # `epoch` is the last COMPLETED epoch; resume must start at the NEXT one.
+        # Prefer the explicit v2 next_epoch; fall back to epoch+1 for v1.
+        saved_epoch = int(checkpoint["epoch"])
+        self.start_epoch = resolve_next_epoch(checkpoint)
+        if self.start_epoch != saved_epoch + 1:
+            logging.warning(
+                "Checkpoint next_epoch=%d disagrees with epoch+1=%d; trusting "
+                "the explicit next_epoch.",
+                self.start_epoch, saved_epoch + 1,
+            )
         # Restore best-tracking so resumed runs don't overwrite checkpoint_best.pth
         # with a worse score (old checkpoints without these keys fall back to None).
         self._resumed_best_metric = checkpoint.get("best_agg_metric", None)
         self._resumed_best_epoch = checkpoint.get("best_epoch", None)
+
+        resume_kind = "FULL" if not resume_partial_reasons else "PARTIAL"
         logging.info(
-            "Resume checkpoint from {} (best_agg_metric={}, best_epoch={})".format(
-                url_or_filename, self._resumed_best_metric, self._resumed_best_epoch
-            )
+            "===== RESUME %s | path=%s | version=%s | last_completed_epoch=%d | "
+            "start_epoch=%d | max_epoch=%d | scaler=%s | global_step=%s | "
+            "best_agg_metric=%s | best_epoch=%s%s =====",
+            resume_kind,
+            url_or_filename,
+            checkpoint.get("checkpoint_version", "legacy_v1"),
+            saved_epoch,
+            self.start_epoch,
+            self.max_epoch,
+            scaler_status,
+            checkpoint.get("global_optimizer_step"),
+            self._resumed_best_metric,
+            self._resumed_best_epoch,
+            "" if not resume_partial_reasons else f" | partial={resume_partial_reasons}",
         )
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier()
 
     def _delete_local_resume_checkpoint_after_load(self, checkpoint_path):
         if not checkpoint_path or is_url(checkpoint_path) or not os.path.isfile(checkpoint_path):
