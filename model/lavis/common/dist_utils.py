@@ -78,14 +78,19 @@ def init_distributed_mode(args):
         ),
         flush=True,
     )
+    # Bound the collective timeout so a desynced/stalled rank (one-rank OOM or
+    # exception on a heavy multi-view batch, the peer then waiting at all-reduce)
+    # aborts with a diagnosable NCCL watchdog error in minutes, instead of hanging
+    # silently for hours -- a 365-day timeout turned every stall into an unbounded
+    # hang. 30 min still covers a cold first collective while both ranks finish
+    # downloading the frozen encoders. Override with run.dist_timeout_minutes.
+    timeout_minutes = float(args.run_cfg.get("dist_timeout_minutes", 30))
     torch.distributed.init_process_group(
         backend=args.dist_backend,
         init_method=args.dist_url,
         world_size=args.world_size,
         rank=args.rank,
-        timeout=datetime.timedelta(
-            days=365
-        ),  # allow auto-downloading and de-compressing
+        timeout=datetime.timedelta(minutes=timeout_minutes),
     )
     torch.distributed.barrier()
     setup_for_distributed(args.rank == 0)
