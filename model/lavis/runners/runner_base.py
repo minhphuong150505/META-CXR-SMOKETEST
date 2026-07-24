@@ -935,6 +935,13 @@ class RunnerBase:
                 )
                 if num_workers > 0:
                     loader_kwargs["prefetch_factor"] = 2
+                    # Bound per-batch worker fetch time so a stalled/hung image
+                    # read raises RuntimeError instead of blocking next(loader)
+                    # forever. Normal batches take ~1s, so this only trips on a
+                    # real stall. Override with run.dataloader_timeout (0 disables).
+                    dl_timeout = float(self.config.run_cfg.get("dataloader_timeout", 600))
+                    if dl_timeout > 0:
+                        loader_kwargs["timeout"] = dl_timeout
 
                 loader = DataLoader(dataset, **loader_kwargs)
                 #loader = PrefetchLoader(loader)

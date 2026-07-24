@@ -18,7 +18,11 @@ model:
     frozen: true
     normalize: true
   num_query_token: 32
-  max_txt_len: 256
+  # 128 (was 256) caps the Q-Former text branch to halve its activation memory on
+  # the 16GB T4; heavy multi-view + long-text batches were pushing peak VRAM toward
+  # the ceiling and OOM-ing one rank mid-epoch. Not part of config_fingerprint, so
+  # resume identity is unchanged.
+  max_txt_len: 128
   mhcac:
     threshold_path: "threshold.json"
   multi_view: true

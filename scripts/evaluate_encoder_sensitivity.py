@@ -104,12 +104,17 @@ def main() -> None:
     ]
     cfg = Config(SimpleNamespace(cfg_path=args.cfg_path, options=options))
     model = ImageTextPretrainTask().build_model(cfg)
-    identity = {
-        "source_commit": args.source_commit,
+    # The eval identity gates ONLY on dataset + config fingerprint, matching the
+    # two-field dict training writes into checkpoint["identity"]. source_commit
+    # is provenance (stored top-level, deliberately NOT in identity), so the
+    # eval-code commit may differ from the commit that trained the checkpoint
+    # without stranding it.
+    expected_identity = {
         "dataset_manifest_sha256": args.dataset_manifest_sha256,
         "config_fingerprint": args.config_fingerprint,
     }
-    checkpoint = load_model_state(model, Path(args.checkpoint), identity)
+    checkpoint = load_model_state(model, Path(args.checkpoint), expected_identity)
+    checkpoint_source_commit = checkpoint.get("source_commit")
     device = torch.device("cuda:0")
     model.to(device).eval()
 
@@ -190,7 +195,9 @@ def main() -> None:
         "method": "single_E123_checkpoint_post_training_inference_sensitivity",
         "warning": "Not independent ablation and not causal contribution.",
         "uncertain_policy": "ignore_uncertain",
-        "checkpoint_identity": identity,
+        "checkpoint_identity": expected_identity,
+        "checkpoint_source_commit": checkpoint_source_commit,
+        "eval_source_commit": args.source_commit,
         "checkpoint_epoch": checkpoint.get("epoch"),
         "masks": {name: list(value) for name, value in MASKS.items()},
         "reports": reports,
