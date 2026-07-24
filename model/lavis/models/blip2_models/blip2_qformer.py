@@ -680,11 +680,13 @@ class Blip2Qformer(Blip2Base):
         image_embeds_all = self._gather_with_local_grad(image_embeds)
         text_ids_all_ranks = concat_all_gather(text_tokens.input_ids)
         text_atts_all_ranks = concat_all_gather(text_tokens.attention_mask)
-        # A rank whose local batch has no valid report still had to participate
-        # in the gathers above; return a connected zero now so it neither crashes
-        # on empty local indexing (torch.stack([])) nor desyncs the collectives.
-        if not valid_mask.any():
-            return zero
+        # A rank whose local batch has no valid report still had to participate in
+        # the gathers above. It must ALSO run itm_head + the Qformer cross-attention
+        # below (on a dummy row) so those params are used on every rank -> identical
+        # DDP grad-readiness order. The old `return zero` skipped them here while a
+        # peer used them -> bucket-rebuild order diverged -> NCCL deadlock. The dummy
+        # row's loss is zeroed out at the end.
+        local_valid = bool(valid_mask.any())
         batch_size = image_embeds.shape[0]
         rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
         positive_indices = rank * batch_size + torch.arange(
@@ -702,7 +704,16 @@ class Blip2Qformer(Blip2Base):
             weights_t2i = weights_t2i / weights_t2i.sum(dim=1, keepdim=True).clamp_min(1e-12)
             weights_i2t = weights_i2t / weights_i2t.sum(dim=1, keepdim=True).clamp_min(1e-12)
 
-        local_indices = valid_mask.nonzero(as_tuple=True)[0]
+        # Fall back to a single dummy row when this rank has no valid report so the
+        # ITM forward still runs (params used); its loss is masked to zero below.
+        # valid_all.sum() >= 2 keeps each row's negative-sampling distribution
+        # non-degenerate, so multinomial is safe even for the dummy row.
+        if local_valid:
+            local_indices = valid_mask.nonzero(as_tuple=True)[0]
+        else:
+            local_indices = torch.zeros(
+                1, dtype=torch.long, device=image_embeds.device
+            )
         negative_image_indices = torch.stack(
             [torch.multinomial(weights_t2i[i], 1).squeeze(0) for i in local_indices]
         )
@@ -744,13 +755,22 @@ class Blip2Qformer(Blip2Base):
                 torch.zeros(2 * num_positive, dtype=torch.long, device=image_embeds.device),
             ]
         )
-        return F.cross_entropy(logits, labels)
+        loss_itm = F.cross_entropy(logits, labels)
+        # Zero (but keep connected to itm_head/Qformer params) when this rank ran
+        # only the dummy row, so it adds no gradient signal.
+        if not local_valid:
+            loss_itm = loss_itm * 0.0
+        return loss_itm
 
     def _language_modeling(self, text_tokens, query_tokens, query_output, valid_mask):
-        zero = query_output.last_hidden_state.sum() * 0.0
-        if not valid_mask.any():
-            return zero
-
+        # Run the LM forward UNCONDITIONALLY so the Qformer LM head is used on every
+        # rank, including one whose micro-batch has no valid report. A local
+        # `if not valid_mask.any(): return zero` skipped these params on that rank
+        # while a peer used them, so they became grad-ready at different points ->
+        # DDP bucket-rebuild order diverged -> NCCL all-reduce deadlock. Invalid rows
+        # are masked to -100 (no loss); the zero stays connected to output.loss (and
+        # thus the LM-head params) so the branch enters the graph at the same
+        # position on every rank.
         decoder_input_ids = text_tokens.input_ids.clone()
         decoder_input_ids[:, 0] = self.tokenizer.bos_token_id
         labels = decoder_input_ids.masked_fill(
@@ -769,9 +789,10 @@ class Blip2Qformer(Blip2Base):
             reduction="none",
         )
         token_count = (labels[:, 1:] != -100).sum()
-        if token_count == 0:
-            return zero
-        return output.loss.sum() / token_count
+        # clamp_min(1) makes a no-valid-token rank return a graph-connected zero
+        # (output.loss is all-zero for -100 targets) instead of skipping the head;
+        # for token_count > 0 this is exactly the original mean.
+        return output.loss.sum() / token_count.clamp_min(1)
 
     def forward(self, samples):
         image = samples.get("image")
