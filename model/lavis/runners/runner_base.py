@@ -730,6 +730,15 @@ class RunnerBase:
             self.start_epoch,
             self.max_epoch,
         )
+        # Same guaranteed-visible echo (INFO is filtered in the notebook), so the
+        # first epoch the run will train is always printed — including on resume.
+        if is_main_process():
+            print(
+                f"===== [{self.run_role}] TRAINING LOOP START | "
+                f"resume={'yes' if self.resume_ckpt_path is not None else 'no'} | "
+                f"first_epoch_to_run={self.start_epoch} | max_epoch={self.max_epoch} =====",
+                flush=True,
+            )
 
         for cur_epoch in range(self.start_epoch, self.max_epoch):
             if hasattr(self.train_loader, "set_epoch"):
@@ -1310,6 +1319,18 @@ class RunnerBase:
             self._resumed_best_epoch,
             "" if not resume_partial_reasons else f" | partial={resume_partial_reasons}",
         )
+        # Guaranteed-visible echo on the main rank: the environment filters INFO
+        # (only WARNING+ shows), so the logging.info banner above never reaches
+        # the notebook — that is exactly why a resumed run "does not show" its
+        # starting epoch. print(flush=True) bypasses both the log level and any
+        # stdout buffering.
+        if is_main_process():
+            print(
+                f"===== RESUME {resume_kind} | last_completed_epoch={saved_epoch} | "
+                f"start_epoch={self.start_epoch} | max_epoch={self.max_epoch} | "
+                f"scaler={scaler_status} =====",
+                flush=True,
+            )
         if dist.is_available() and dist.is_initialized():
             dist.barrier()
 
