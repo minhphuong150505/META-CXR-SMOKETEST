@@ -878,9 +878,30 @@ class Blip2Qformer(Blip2Base):
         teacher_mask = classification_mask & generation_mask
         loss_teacher_cls = student_logits.sum() * 0.0
         loss_distill = student_logits.sum() * 0.0
-        if teacher_mask.any() and (
-            self.lambda_teacher_cls > 0 or self.lambda_distill > 0
-        ):
+        # GLOBAL gate. `teacher_mask.any()` is a per-rank observation, but the
+        # teacher MHCAC below uses the teacher-only text-attention params. A LOCAL
+        # gate let a rank whose micro-batch had a valid FINDINGS run that forward
+        # while a peer rank (none valid this step) skipped it, so those params
+        # became grad-ready at different points across ranks -> DDP launches its
+        # gradient all-reduce buckets in different orders -> NCCL deadlock. Same
+        # class of bug already fixed for ITM via the global `valid_all` gate;
+        # find_unused_parameters=True does not prevent it. All-reduce the flag so
+        # every rank runs-or-skips the teacher branch together. The lambda check is
+        # a static per-run constant (identical on every rank), so gating the
+        # collective on it adds no desync and skips the all-reduce when the teacher
+        # is disabled. On a rank that runs only because a peer had a valid target,
+        # teacher_mask is locally all-False and ClassificationLoss returns a
+        # graph-connected `logits.sum()*0.0`, so the teacher params still enter the
+        # graph at the same position -> identical bucket order.
+        teacher_active = False
+        if self.lambda_teacher_cls > 0 or self.lambda_distill > 0:
+            local_has_teacher = torch.as_tensor(
+                float(teacher_mask.any()), device=device
+            )
+            if dist.is_available() and dist.is_initialized():
+                dist.all_reduce(local_has_teacher, op=dist.ReduceOp.MAX)
+            teacher_active = local_has_teacher.item() > 0
+        if teacher_active:
             teacher_logits, _, _, _, _ = self.mhcac(
                 shared_visual,
                 text_embeddings=text_output.last_hidden_state,
