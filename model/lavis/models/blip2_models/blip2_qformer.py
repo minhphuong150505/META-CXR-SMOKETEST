@@ -943,6 +943,17 @@ class Blip2Qformer(Blip2Base):
             + self.lambda_mpc * loss_mpc
             + self.lambda_view_consistency * loss_view_consistency
         )
+        # DDP determinism guard. ITM (`itm_head`) and the teacher MHCAC
+        # text-attention run only on ranks whose local batch has a valid report,
+        # so those params are used on some ranks and skipped on others in the
+        # same step. That per-rank divergence in the used-parameter set makes DDP
+        # launch its gradient all-reduce buckets in different orders across ranks
+        # -> NCCL deadlock (find_unused_parameters=True does not prevent it).
+        # A zero-weighted touch pulls EVERY trainable parameter into the graph on
+        # every rank, so the used-parameter set — and thus the bucket order — is
+        # identical everywhere. It adds no gradient signal (multiplied by 0).
+        ddp_param_touch = sum(p.sum() for p in self.parameters() if p.requires_grad)
+        total_loss = total_loss + 0.0 * ddp_param_touch
         return BlipOutput(
             loss=total_loss,
             loss_itc=loss_itc,
