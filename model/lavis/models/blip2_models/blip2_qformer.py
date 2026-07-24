@@ -669,12 +669,22 @@ class Blip2Qformer(Blip2Base):
         sim_t2i,
     ):
         zero = image_embeds.sum() * 0.0
-        if not valid_mask.any() or valid_all.sum() < 2:
+        # GLOBAL gate only. valid_all is gathered across ranks, so every rank
+        # decides identically here. The old `not valid_mask.any()` term was
+        # LOCAL: a rank whose own batch had no valid report returned here and
+        # skipped the three all-gathers below while the peer ran them, leaving
+        # the ranks one collective apart -> NCCL ALLGATHER timeout/deadlock.
+        if valid_all.sum() < 2:
             return zero
 
         image_embeds_all = self._gather_with_local_grad(image_embeds)
         text_ids_all_ranks = concat_all_gather(text_tokens.input_ids)
         text_atts_all_ranks = concat_all_gather(text_tokens.attention_mask)
+        # A rank whose local batch has no valid report still had to participate
+        # in the gathers above; return a connected zero now so it neither crashes
+        # on empty local indexing (torch.stack([])) nor desyncs the collectives.
+        if not valid_mask.any():
+            return zero
         batch_size = image_embeds.shape[0]
         rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
         positive_indices = rank * batch_size + torch.arange(
