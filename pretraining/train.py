@@ -6,6 +6,7 @@
 """
 
 import argparse
+import os
 import random
 
 import numpy as np
@@ -79,6 +80,13 @@ def main():
     cfg = Config(parse_args())
 
     job_id = now()
+
+    # NCCL watchdog: turn a stuck collective into a raised error with a traceback
+    # (naming the rank + collective) instead of an indefinite silent hang, so any
+    # residual data-dependent DDP desync is diagnosable rather than a 28-minute
+    # deadlock. setdefault so an explicit env override still wins.
+    os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
+    os.environ.setdefault("NCCL_ASYNC_ERROR_HANDLING", "1")
 
     # Initialize distributed training (reads RANK, WORLD_SIZE, LOCAL_RANK set by torchrun)
     init_distributed_mode(cfg)
