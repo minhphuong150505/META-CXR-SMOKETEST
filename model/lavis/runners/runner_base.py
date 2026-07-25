@@ -1105,7 +1105,16 @@ class RunnerBase:
             save_obj.get("global_optimizer_step"),
             save_to,
         )
-        torch.save(save_obj, save_to)
+        # Atomic write (Task H #12): a crash or OOM mid-torch.save would leave a
+        # truncated checkpoint_last.pth that a later resume cannot load. Write to
+        # a temp file, fsync, then os.replace -- an atomic rename on POSIX -- so
+        # the live checkpoint is only ever the fully-written prior or new one.
+        tmp_to = save_to + ".tmp"
+        with open(tmp_to, "wb") as f:
+            torch.save(save_obj, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_to, save_to)
 
     def _fresh_scaler_state(self):
         """A pristine GradScaler state_dict, matching the runner's scaler ctor."""
