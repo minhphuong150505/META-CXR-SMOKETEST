@@ -397,7 +397,30 @@ class Blip2Qformer(Blip2Base):
             return anchor
         aux = aux_streams.get(name)
         if aux is None:
-            return anchor
+            # This micro-batch has NO auxiliary view on this rank, but a peer rank
+            # may have one. The old `return anchor` skipped the fusion module here,
+            # so its parameters were used on some ranks and skipped on others in
+            # the SAME step. DDP then made those params grad-ready in a different
+            # ORDER across ranks, and NCCL -- which matches collectives purely by
+            # issue order (no tags) -- deadlocked at the first backward. Neither
+            # find_unused_parameters=True nor the zero-weighted `ddp_param_touch`
+            # in forward() fixes this: they equalise the *set* of used params, not
+            # the reduction *order* (that is why gloo, which tags collectives, did
+            # not hang while NCCL did). Instead, always run the module on a zero
+            # auxiliary with an all-False mask, passing anchor_view_id through so
+            # `view_emb` is exercised too. ViewFusionModule gates both residual
+            # branches to zero for a study with no auxiliary view, so the output
+            # equals `anchor` bit-for-bit (no scientific change) while every
+            # view_fusion parameter enters the graph identically on every rank and
+            # every step.
+            batch, _, dim = anchor.shape
+            aux = anchor.new_zeros(batch, 1, 1, dim)
+            aux_mask = anchor.new_zeros(batch, 1, dtype=torch.bool)
+            aux_view_ids = None
+            if anchor_view_id is None:
+                anchor_view_id = torch.zeros(
+                    batch, dtype=torch.long, device=anchor.device
+                )
         return self.view_fusion[name](
             anchor, aux.to(anchor.dtype), aux_mask, anchor_view_id, aux_view_ids
         )

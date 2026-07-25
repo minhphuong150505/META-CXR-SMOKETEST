@@ -57,6 +57,37 @@ def test_no_aux_returns_anchor():
     print("ok: n=0 gate returns anchor exactly, finite, batch-dense")
 
 
+def test_fuse_dummy_aux_keeps_every_param_used():
+    """DDP safety: Blip2Qformer._fuse now runs the module even on a micro-batch
+    with no auxiliary view, using a zero aux [B,1,1,D] + all-False mask + a real
+    anchor_view_id. That must (a) return the anchor bit-for-bit and (b) keep every
+    trainable parameter -- view_emb included -- in the autograd graph, so DDP sees
+    the same used-parameter set in the same grad-ready order on every rank. This
+    mirrors the exact synthesized call in _fuse; if ViewFusionModule stops gating
+    to zero or stops touching view_emb, this fails and the NCCL deadlock returns.
+    """
+    m = make_module(p_view_drop=0.0).train()
+    for blk in m.blocks:  # move off zero-init so only the gate can make it identity
+        torch.nn.init.normal_(blk.w_o.weight, std=0.5)
+        torch.nn.init.normal_(blk.w_o.bias, std=0.5)
+        torch.nn.init.normal_(blk.ffn[-1].weight, std=0.5)
+        torch.nn.init.normal_(blk.ffn[-1].bias, std=0.5)
+
+    anchor = torch.randn(B, P, D)
+    dummy_aux = anchor.new_zeros(B, 1, 1, D)
+    empty_mask = anchor.new_zeros(B, 1, dtype=torch.bool)
+    out = m(anchor, dummy_aux, empty_mask,
+            anchor_view_id=torch.tensor([0, 1, 2]), aux_view_ids=None)
+    assert torch.allclose(out, anchor, atol=1e-6), (out - anchor).abs().max()
+
+    out.sum().backward()
+    missing = [n for n, p in m.named_parameters()
+               if p.requires_grad and p.grad is None]
+    assert not missing, f"params left out of the graph on the dummy-aux path: {missing}"
+    assert m.view_emb.weight.grad is not None, "view_emb must stay in the graph"
+    print("ok: dummy-aux _fuse path is identity and keeps every param used")
+
+
 def test_shapes():
     """Checklist 4: [B,P,D] in -> [B,P,D] out for N in {0,1,3} and mixed counts."""
     m = make_module(p_view_drop=0.0).eval()
@@ -130,6 +161,7 @@ def test_view_dropout_train_only():
 if __name__ == "__main__":
     test_zero_init_identity()
     test_no_aux_returns_anchor()
+    test_fuse_dummy_aux_keeps_every_param_used()
     test_shapes()
     test_gradient_reaches_kv()
     test_view_dropout_train_only()

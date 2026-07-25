@@ -84,9 +84,10 @@ def main():
     # NCCL watchdog: turn a stuck collective into a raised error with a traceback
     # (naming the rank + collective) instead of an indefinite silent hang, so any
     # residual data-dependent DDP desync is diagnosable rather than a 28-minute
-    # deadlock. setdefault so an explicit env override still wins.
+    # deadlock. setdefault so an explicit env override still wins. Only the
+    # TORCH_-prefixed name is used; the bare NCCL_ASYNC_ERROR_HANDLING was
+    # deprecated in torch 2.2 and merely emits a warning on current torch.
     os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
-    os.environ.setdefault("NCCL_ASYNC_ERROR_HANDLING", "1")
 
     # Initialize distributed training (reads RANK, WORLD_SIZE, LOCAL_RANK set by torchrun)
     init_distributed_mode(cfg)
