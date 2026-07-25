@@ -44,6 +44,7 @@ from smoke.resume import (
     build_runtime_contract,
     capture_rng_state,
     diff_states,
+    new_grad_scaler,
     normalize_resume_mode,
     resolve_next_epoch,
     restore_rng_state,
@@ -266,10 +267,7 @@ class RunnerBase:
 
         if amp:
             if self._scaler is None:
-                try:
-                    self._scaler = torch.amp.GradScaler("cuda")
-                except (AttributeError, TypeError):
-                    self._scaler = torch.cuda.amp.GradScaler()
+                self._scaler = new_grad_scaler()
 
         return self._scaler
 
@@ -811,6 +809,11 @@ class RunnerBase:
                 best_agg_metric = resumed_metric
             if resumed_epoch is not None:
                 best_epoch = resumed_epoch
+            else:
+                # Best tracking was reset (changed/unknown selection metric).
+                # Anchoring it at the resume point keeps early stopping counting
+                # from now instead of from epoch 0, which would fire immediately.
+                best_epoch = self.start_epoch
 
         # Unambiguous banner: names the role (preflight vs real train) and the
         # first epoch this process will actually run, so a resumed run showing
@@ -1189,6 +1192,14 @@ class RunnerBase:
             "next_epoch": cur_epoch + 1,
             "best_agg_metric": best_agg_metric,
             "best_epoch": best_epoch,
+            # `best_agg_metric` is only meaningful together with the metric that
+            # produced it. Restoring a best F1 of 0.11 into a run that now selects
+            # on a min-mode val loss would make every later epoch look worse than
+            # the resume point and checkpoint_best.pth would never be rewritten.
+            "selection": {
+                "metric": self.selection_metric,
+                "mode": self.selection_mode,
+            },
         }
         scaler_healthy = None
         if include_training_state:
@@ -1299,11 +1310,7 @@ class RunnerBase:
 
     def _fresh_scaler_state(self):
         """A pristine GradScaler state_dict, matching the runner's scaler ctor."""
-        try:
-            fresh = torch.amp.GradScaler("cuda")
-        except (AttributeError, TypeError):
-            fresh = torch.cuda.amp.GradScaler()
-        return fresh.state_dict()
+        return new_grad_scaler().state_dict()
 
     def _reload_best_model(self, model):
         """
@@ -1651,6 +1658,31 @@ class RunnerBase:
         # with a worse score (old checkpoints without these keys fall back to None).
         self._resumed_best_metric = checkpoint.get("best_agg_metric", None)
         self._resumed_best_epoch = checkpoint.get("best_epoch", None)
+
+        # ... but only when the restored value is comparable. A checkpoint that
+        # predates the `selection` key (v3 and earlier) carries a best score from
+        # an unknown metric, which is exactly as unusable as a changed one.
+        saved_selection = checkpoint.get("selection")
+        current_selection = {
+            "metric": self.selection_metric,
+            "mode": self.selection_mode,
+        }
+        if self._resumed_best_metric is not None and saved_selection != current_selection:
+            logging.warning(
+                "Checkpoint selection metric %s != configured %s; discarding the "
+                "restored best score (%s) so the first resumed epoch can claim "
+                "checkpoint_best.pth. The existing checkpoint_best.pth was chosen "
+                "by the OLD metric.",
+                saved_selection, current_selection, self._resumed_best_metric,
+            )
+            self._resumed_best_metric = None
+            self._resumed_best_epoch = None
+            report.ok(
+                "selection",
+                f"{saved_selection} -> {current_selection}; best tracking reset",
+            )
+        else:
+            report.ok("selection", str(current_selection))
 
         # The resumed LR must equal the LR the checkpoint was saved at. The
         # scheduler recomputes it at the top of each accumulation window, so this

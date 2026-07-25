@@ -110,8 +110,12 @@ run:
   deterministic: false
 
   uncertain_policy: ignore_uncertain
-  selection_metric: f1_positive_macro_defined_only
-  selection_mode: max
+  # Validation loss of the image-only student, computed by image_text_pretrain.py
+  # with the same ClassificationLoss and mask as the training step. `loss` (the
+  # full ITC+ITM+LM+cls objective) is only produced when classification_only_eval
+  # is false; switching to it also means paying for the text path at eval.
+  selection_metric: loss_cls
+  selection_mode: min
   classification_only_eval: true
   save_predictions: false
   finalize_test: false

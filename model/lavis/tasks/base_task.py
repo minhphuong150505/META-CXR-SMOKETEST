@@ -17,6 +17,7 @@ from model.lavis.common.dist_utils import get_rank, get_world_size, is_main_proc
 from model.lavis.common.logger import MetricLogger, SmoothedValue
 from model.lavis.common.registry import registry
 from model.lavis.datasets.data_utils import prepare_sample
+from smoke.resume import AMP_MIN_SCALE, reset_scaler_scale
 from torch.nn.utils import clip_grad_norm_
 
 # Opt-in per-rank DDP tracing. Off by default (production is unaffected); enable
@@ -281,6 +282,7 @@ class BaseTask:
         micro_steps = 0
         overflow_steps = 0
         consecutive_overflows = 0
+        amp_collapse_resets = 0
 
         for i in metric_logger.log_every(range(iters_per_epoch), log_freq, header):
             # if using iter-based runner, we stop after iters_per_epoch iterations.
@@ -428,17 +430,29 @@ class BaseTask:
                             consecutive_overflows,
                             None if grad_norm is None else float(grad_norm),
                         )
-                        if new_scale <= 0 or not math.isfinite(new_scale):
-                            raise RuntimeError(
-                                f"GradScaler collapsed to scale={new_scale} at "
-                                f"epoch {inner_epoch} iter {i} after "
-                                f"{consecutive_overflows} consecutive fp16 "
-                                "overflows. Every subsequent optimizer step would "
-                                "be skipped and no checkpoint from here on can "
-                                "reproduce a continuous run. Investigate fp16 "
-                                "stability (loss magnitude, encoder output range) "
-                                "or disable run.amp."
+                        if new_scale < AMP_MIN_SCALE or not math.isfinite(new_scale):
+                            # Do NOT let the scale keep halving. Below 1.0 it
+                            # shrinks gradients instead of protecting them, and a
+                            # few more backoffs take it to exactly 0, at which
+                            # point scaler.step() is a permanent no-op: training
+                            # runs to completion, saves checkpoints, and never
+                            # updates a single weight (run e123). Lift it back to
+                            # the initial scale and keep training -- the epoch
+                            # stays resumable, and amp_collapse_resets in the
+                            # epoch stats says how often it happened.
+                            previous = reset_scaler_scale(scaler)
+                            amp_collapse_resets += 1
+                            logging.error(
+                                "AMP scale collapsed to %s at epoch %s iter %d "
+                                "after %d consecutive overflows; reset to %s "
+                                "(reset #%d this epoch). Weights would otherwise "
+                                "stop updating. Investigate fp16 stability (loss "
+                                "magnitude, encoder output range) or set "
+                                "run.amp: false.",
+                                previous, inner_epoch, i, consecutive_overflows,
+                                scaler.get_scale(), amp_collapse_resets,
                             )
+                            consecutive_overflows = 0
                     else:
                         optimizer_steps += 1
                         consecutive_overflows = 0
@@ -488,6 +502,7 @@ class BaseTask:
         stats["optimizer_steps_taken"] = optimizer_steps
         stats["micro_steps_taken"] = micro_steps
         stats["amp_overflow_steps"] = overflow_steps
+        stats["amp_collapse_resets"] = amp_collapse_resets
         elapsed = time.perf_counter() - epoch_started
         peak_vram = torch.cuda.max_memory_allocated() if cuda_enabled else 0
         local_runtime = torch.tensor(
