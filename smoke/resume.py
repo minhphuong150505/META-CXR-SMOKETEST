@@ -35,15 +35,31 @@ import random
 import numpy as np
 import torch
 
-
 # Bump whenever the on-disk checkpoint schema changes in a way the load path
 # must branch on.
 #   v1 (implicit, no key): {model, optimizer, scaler, rng_by_rank, epoch, ...}
 #   v2: adds checkpoint_version, next_epoch, scaler_healthy,
 #       optimizer_steps_per_epoch, global_optimizer_step.
-CHECKPOINT_VERSION = 2
+#   v3: adds scheduler (stateless config snapshot), runtime_contract,
+#       global_step/optimizer_step/micro_step, per-rank dataloader generator
+#       state, and lr_by_group. Written whenever resume_mode is honoured.
+CHECKPOINT_VERSION = 3
 
-_RNG_STREAMS = ("python", "numpy", "torch", "cuda")
+_RNG_STREAMS = ("python", "numpy", "torch", "cuda", "dataloader_generator")
+
+# The two resume contracts.  ``strict`` refuses to continue unless every piece
+# of training state came back verbatim; ``best_effort`` restores what it can and
+# is required to label the result PARTIAL.
+RESUME_MODES = ("strict", "best_effort")
+
+
+def normalize_resume_mode(value) -> str:
+    mode = str(value or "strict").strip().lower()
+    if mode not in RESUME_MODES:
+        raise ValueError(
+            f"run.resume_mode must be one of {RESUME_MODES}, got {value!r}"
+        )
+    return mode
 
 
 def as_cpu_byte_tensor(state) -> torch.Tensor:
@@ -60,22 +76,30 @@ def as_cpu_byte_tensor(state) -> torch.Tensor:
     return state.detach().to(device="cpu", dtype=torch.uint8).contiguous()
 
 
-def capture_rng_state() -> dict:
+def capture_rng_state(generator: torch.Generator | None = None) -> dict:
     """Snapshot every RNG stream a training step advances.
 
     ``torch``/``cuda`` entries are native CPU ByteTensors; ``python``/``numpy``
     are their libraries' opaque state objects.  Safe to ``all_gather_object``
     across ranks and ``torch.save``.
+
+    ``generator`` is the ``torch.Generator`` handed to the train ``DataLoader``.
+    It is a *separate* RNG stream from the global one -- it drives shuffling and
+    worker seeding -- so restoring the global torch RNG alone does not reproduce
+    the batch order.  ``None`` is recorded as absent, not as a failure.
     """
     return {
         "python": random.getstate(),
         "numpy": np.random.get_state(),
         "torch": torch.get_rng_state(),
         "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
+        "dataloader_generator": (
+            generator.get_state() if generator is not None else None
+        ),
     }
 
 
-def restore_rng_state(rng: dict) -> dict:
+def restore_rng_state(rng: dict, generator: torch.Generator | None = None) -> dict:
     """Restore RNG streams captured by :func:`capture_rng_state`.
 
     Returns ``{stream_name: bool}`` recording which streams were actually
@@ -125,6 +149,18 @@ def restore_rng_state(rng: dict) -> dict:
         # Saved CUDA RNG but resuming without CUDA — cannot restore it.
         restored["cuda"] = False
 
+    gen_state = rng.get("dataloader_generator")
+    if generator is None:
+        # No generator on this side: only a *saved* state is unrestorable.
+        restored["dataloader_generator"] = gen_state is None
+    elif gen_state is None:
+        # A generator exists now but the checkpoint carries no state for it,
+        # so the shuffle stream cannot be continued.
+        restored["dataloader_generator"] = False
+    else:
+        generator.set_state(as_cpu_byte_tensor(gen_state))
+        restored["dataloader_generator"] = True
+
     return restored
 
 
@@ -153,6 +189,160 @@ def scaler_state_health(state) -> tuple[str, float | None]:
     if scale_val <= 0:
         return ("degenerate", scale_val)
     return ("healthy", scale_val)
+
+
+# --------------------------------------------------------------------------- #
+# Scheduler                                                                    #
+# --------------------------------------------------------------------------- #
+# The LAVIS schedulers in ``model/lavis/common/optims.py`` are *stateless*: LR is
+# a pure function of (cur_epoch, cur_step, steps_per_epoch) and the constructor
+# arguments below.  There is therefore no running counter to restore -- but the
+# constructor arguments ARE load-bearing, and silently changing one (the classic
+# case: ``scheduler_max_epoch: 10`` becoming ``max_epoch: 2`` on the resume
+# command line) rewrites the whole cosine curve mid-run.  Snapshotting them makes
+# that a hard failure instead of an invisible LR jump.
+SCHEDULER_FIELDS = (
+    "max_epoch",
+    "min_lr",
+    "init_lr",
+    "warmup_steps",
+    "warmup_start_lr",
+    "decay_rate",
+)
+
+
+def scheduler_state(scheduler) -> dict:
+    """Snapshot a LAVIS scheduler.
+
+    ``class`` plus the constructor fields fully determine its LR curve.  Any
+    attribute the concrete scheduler does not define is simply omitted.
+    """
+    state = {"class": type(scheduler).__name__}
+    for field in SCHEDULER_FIELDS:
+        if hasattr(scheduler, field):
+            value = getattr(scheduler, field)
+            state[field] = float(value) if isinstance(value, (int, float)) else value
+    return state
+
+
+def diff_states(saved, current) -> list[str]:
+    """Field names whose values differ between two flat dicts.
+
+    A missing key on either side counts as a difference; ``None`` for ``saved``
+    means the checkpoint predates the field and every key is reported.
+    """
+    if not isinstance(saved, dict):
+        return sorted(current) if isinstance(current, dict) else ["<absent>"]
+    keys = set(saved) | set(current)
+    return sorted(k for k in keys if saved.get(k) != current.get(k))
+
+
+# --------------------------------------------------------------------------- #
+# Runtime contract                                                             #
+# --------------------------------------------------------------------------- #
+# Everything that must be identical for a resumed run to follow the same
+# trajectory as an uninterrupted one, but which is NOT already covered by
+# ``smoke.identity`` (dataset manifest + config fingerprint).
+#
+# Deliberately excluded because they legitimately change between the two halves
+# of the same run, and including them would make every resume mismatch:
+#   run.max_epoch, run.resume_ckpt_path, run.wandb_run_id, run.run_role,
+#   run.output_dir, run.run_name, run.delete_resume_ckpt_after_load.
+RUNTIME_CONTRACT_FIELDS = (
+    "world_size",
+    "batch_size_train",
+    "accum_grad_iters",
+    "num_workers",
+    "persistent_workers",
+    "seed",
+    "amp",
+    "deterministic",
+    "lr_sched",
+    "scheduler_max_epoch",
+    "init_lr",
+    "init_lr_cls",
+    "init_lr_q",
+    "min_lr",
+    "warmup_lr",
+    "warmup_steps",
+    "weight_decay",
+    "beta2",
+    "max_grad_norm",
+)
+
+
+def build_runtime_contract(run_cfg, world_size: int) -> dict:
+    """The subset of run config a strict resume must find unchanged."""
+    contract = {}
+    for field in RUNTIME_CONTRACT_FIELDS:
+        value = run_cfg.get(field, None)
+        if isinstance(value, (int, float, bool)) or value is None:
+            contract[field] = value
+        else:
+            contract[field] = str(value)
+    # world_size is observed, not configured: torchrun --nproc_per_node decides
+    # it, and the YAML copy can disagree with reality.
+    contract["world_size"] = int(world_size)
+    return contract
+
+
+# --------------------------------------------------------------------------- #
+# Resume reporting                                                             #
+# --------------------------------------------------------------------------- #
+class ResumeReport:
+    """Accumulates what a resume did and did not restore.
+
+    ``strict`` mode turns any entry in ``missing`` into a ``RuntimeError``;
+    ``best_effort`` prints them under a PARTIAL RESUME banner.  Keeping the two
+    modes on one object is what stops the loader from calling a resume "FULL"
+    while the scaler was quietly reset.
+    """
+
+    def __init__(self, mode: str):
+        self.mode = normalize_resume_mode(mode)
+        self.fields: dict[str, str] = {}
+        self.missing: list[str] = []
+
+    def ok(self, name: str, detail: str = "loaded") -> None:
+        self.fields[name] = detail
+
+    def fail(self, name: str, detail: str) -> None:
+        self.fields[name] = detail
+        self.missing.append(f"{name}: {detail}")
+
+    @property
+    def strict(self) -> bool:
+        return self.mode == "strict"
+
+    @property
+    def status(self) -> str:
+        return "PARTIAL" if self.missing else "FULL"
+
+    def raise_if_strict(self) -> None:
+        if self.strict and self.missing:
+            raise RuntimeError(
+                "run.resume_mode=strict requires a fully restored training "
+                "state, but the following could not be restored:\n  - "
+                + "\n  - ".join(self.missing)
+                + "\nThis checkpoint cannot reproduce an uninterrupted run. "
+                "Either fix the cause, or set run.resume_mode=best_effort to "
+                "continue from a knowingly PARTIAL resume."
+            )
+
+    def render(self) -> str:
+        title = (
+            "STRICT RESUME VERIFIED" if self.strict and not self.missing
+            else f"{self.status} RESUME"
+        )
+        lines = [f"===== {title} ====="]
+        lines += [f"{k}={v}" for k, v in self.fields.items()]
+        if self.missing:
+            lines.append("missing_or_reset_states:")
+            lines += [f"- {item}" for item in self.missing]
+        lines.append(f"resume_mode={self.mode}")
+        lines.append(f"resume_status={self.status}")
+        lines.append("=" * (len(title) + 12))
+        return "\n".join(lines)
 
 
 def resolve_next_epoch(checkpoint: dict) -> int:

@@ -85,14 +85,28 @@ def init_distributed_mode(args):
     # hang. 30 min still covers a cold first collective while both ranks finish
     # downloading the frozen encoders. Override with run.dist_timeout_minutes.
     timeout_minutes = float(args.run_cfg.get("dist_timeout_minutes", 30))
-    torch.distributed.init_process_group(
+    init_kwargs = dict(
         backend=args.dist_backend,
         init_method=args.dist_url,
         world_size=args.world_size,
         rank=args.rank,
         timeout=datetime.timedelta(minutes=timeout_minutes),
     )
-    torch.distributed.barrier()
+    # Bind the process group to this rank's GPU explicitly. Without it torch
+    # emits "Guessing device ID based on global rank", which is wrong the moment
+    # rank != local_rank (multi-node, or any heterogeneous mapping) and can hang
+    # a barrier. args.gpu already comes from LOCAL_RANK above, so nothing is
+    # inferred here. `device_id` was added in torch 2.3; older versions keep the
+    # previous behaviour rather than failing to start.
+    try:
+        torch.distributed.init_process_group(
+            **init_kwargs, device_id=torch.device(f"cuda:{args.gpu}")
+        )
+    except TypeError:
+        torch.distributed.init_process_group(**init_kwargs)
+    # A device-scoped barrier, for the same reason: the default barrier picks a
+    # device by guessing from the global rank.
+    torch.distributed.barrier(device_ids=[args.gpu])
     setup_for_distributed(args.rank == 0)
 
 

@@ -274,6 +274,13 @@ class BaseTask:
         window_had_nonfinite = False
         current_lr = optimizer.param_groups[0]["lr"]
         loss_dict = {}
+        # Actual counters, as opposed to updates_per_epoch which is the planned
+        # number. They differ whenever a window is dropped for a non-finite loss
+        # or an AMP overflow, and the checkpoint records the actual position.
+        optimizer_steps = 0
+        micro_steps = 0
+        overflow_steps = 0
+        consecutive_overflows = 0
 
         for i in metric_logger.log_every(range(iters_per_epoch), log_freq, header):
             # if using iter-based runner, we stop after iters_per_epoch iterations.
@@ -382,22 +389,81 @@ class BaseTask:
                     scaled_loss.backward()
                 _ddp_marker("AFTER_BACKWARD", epoch=inner_epoch, iter_idx=i, sync=True)
 
+            micro_steps += 1
+
             # update gradients every accum_grad_iters iterations
             if is_sync_step:
                 _ddp_marker("BEFORE_OPTIMIZER_STEP", epoch=inner_epoch, iter_idx=i,
                             sync=True)
                 if use_amp:
-                    # First unscale the gradients before clipping
+                    # Clipping MUST come after unscale_, otherwise max_grad_norm
+                    # is compared against gradients still multiplied by the loss
+                    # scale and the clip is a no-op.
                     scaler.unscale_(optimizer)
-                    if max_grad_norm > 0:
+                    grad_norm = (
                         clip_grad_norm_(model.parameters(), max_grad_norm)
+                        if max_grad_norm > 0
+                        else None
+                    )
+                    old_scale = scaler.get_scale()
                     scaler.step(optimizer)
                     scaler.update()
+                    new_scale = scaler.get_scale()
+                    # scaler.step() is a no-op exactly when unscale_ found an
+                    # inf/NaN gradient, and update() then multiplies the scale by
+                    # backoff_factor. A falling scale is therefore the ground
+                    # truth for "this step was skipped". Logging only on that
+                    # transition keeps the normal path silent while making an AMP
+                    # collapse (the run of consecutive backoffs that drives the
+                    # scale to 0 and permanently freezes the optimizer) visible
+                    # as it happens instead of only in the saved checkpoint.
+                    if new_scale < old_scale:
+                        overflow_steps += 1
+                        consecutive_overflows += 1
+                        logging.warning(
+                            "AMP overflow detected | epoch=%s | iter=%d | "
+                            "old_scale=%s | new_scale=%s | optimizer_step_skipped=%s"
+                            " | consecutive=%d | grad_norm=%s",
+                            inner_epoch, i, old_scale, new_scale, True,
+                            consecutive_overflows,
+                            None if grad_norm is None else float(grad_norm),
+                        )
+                        if new_scale <= 0 or not math.isfinite(new_scale):
+                            raise RuntimeError(
+                                f"GradScaler collapsed to scale={new_scale} at "
+                                f"epoch {inner_epoch} iter {i} after "
+                                f"{consecutive_overflows} consecutive fp16 "
+                                "overflows. Every subsequent optimizer step would "
+                                "be skipped and no checkpoint from here on can "
+                                "reproduce a continuous run. Investigate fp16 "
+                                "stability (loss magnitude, encoder output range) "
+                                "or disable run.amp."
+                            )
+                    else:
+                        optimizer_steps += 1
+                        consecutive_overflows = 0
+                        # A non-finite grad norm that did NOT cause a skipped step
+                        # would mean the optimizer just consumed it.
+                        if grad_norm is not None and not torch.isfinite(grad_norm):
+                            raise RuntimeError(
+                                f"Non-finite gradient norm {float(grad_norm)} was "
+                                f"applied at epoch {inner_epoch} iter {i}: the "
+                                "AMP inf check did not catch it."
+                            )
                 else:
-                    # Directly clip the gradients for non-AMP training
-                    if max_grad_norm > 0:
+                    grad_norm = (
                         clip_grad_norm_(model.parameters(), max_grad_norm)
+                        if max_grad_norm > 0
+                        else None
+                    )
+                    if grad_norm is not None and not torch.isfinite(grad_norm):
+                        raise RuntimeError(
+                            f"Non-finite gradient norm {float(grad_norm)} at "
+                            f"epoch {inner_epoch} iter {i} without AMP; the "
+                            "update would corrupt every weight."
+                        )
                     optimizer.step()
+                    optimizer_steps += 1
                 # Clear grads after each optimizer step; without this, residual
                 # inf/NaN from an AMP overflow persist across iters and corrupt
                 # all subsequent updates.
@@ -419,6 +485,9 @@ class BaseTask:
             for k, meter in metric_logger.meters.items()
         }
         stats["optimizer_steps"] = updates_per_epoch
+        stats["optimizer_steps_taken"] = optimizer_steps
+        stats["micro_steps_taken"] = micro_steps
+        stats["amp_overflow_steps"] = overflow_steps
         elapsed = time.perf_counter() - epoch_started
         peak_vram = torch.cuda.max_memory_allocated() if cuda_enabled else 0
         local_runtime = torch.tensor(

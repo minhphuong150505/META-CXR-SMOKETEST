@@ -97,6 +97,18 @@ run:
   output_dir: /kaggle/working/meta-cxr-output
   amp: true
 
+  # strict  -> a resume must restore model + optimizer + scheduler + scaler +
+  #            per-rank RNG + step counters, and the config/runtime contract must
+  #            match, or the run aborts. This is the mode that makes a resumed
+  #            run equivalent to an uninterrupted one.
+  # best_effort -> restore what is available, reset what is not, and label the
+  #            result PARTIAL RESUME in the log.
+  resume_mode: strict
+  # Kernel-level determinism. Off in production (cudnn.benchmark is a real
+  # throughput win on the frozen conv encoders); the integration test turns it
+  # on. Requires CUBLAS_WORKSPACE_CONFIG=:4096:8 in the environment.
+  deterministic: false
+
   uncertain_policy: ignore_uncertain
   selection_metric: f1_positive_macro_defined_only
   selection_mode: max

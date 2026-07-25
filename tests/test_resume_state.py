@@ -56,7 +56,15 @@ def test_rng_round_trip_reproduces_every_stream():
     torch.manual_seed(999)
     restored = restore_rng_state(state)
 
-    assert restored == {"python": True, "numpy": True, "torch": True, "cuda": True}
+    # dataloader_generator is True here in the "nothing saved, nothing to
+    # restore" sense: no generator was passed to capture_rng_state.
+    assert restored == {
+        "python": True,
+        "numpy": True,
+        "torch": True,
+        "cuda": True,
+        "dataloader_generator": True,
+    }
     assert random.random() == a_py
     assert float(np.random.rand()) == a_np
     assert torch.equal(torch.rand(5), a_th)

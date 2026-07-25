@@ -40,12 +40,35 @@ from torchinfo import summary
 from smoke.identity import assert_checkpoint_identity, build_checkpoint_identity
 from smoke.resume import (
     CHECKPOINT_VERSION,
+    ResumeReport,
+    build_runtime_contract,
     capture_rng_state,
+    diff_states,
+    normalize_resume_mode,
     resolve_next_epoch,
     restore_rng_state,
     scaler_state_health,
+    scheduler_state,
 )
 from smoke.samplers import DistributedEvalSampler
+
+
+def _seed_dataloader_worker(worker_id):
+    """Seed Python's and NumPy's RNG inside each DataLoader worker.
+
+    PyTorch seeds only ``torch`` in a worker; ``random`` and ``numpy`` inherit
+    the parent's state via fork, so every worker draws the *same* augmentation
+    sequence and a resumed run gets a different one than the continuous run did.
+    ``initial_seed()`` is derived from the loader's generator, so this is a pure
+    function of run.seed + rank + epoch.
+    """
+    import random as _random
+
+    import numpy as _np
+
+    seed = torch.initial_seed() % (2 ** 32)
+    _random.seed(seed)
+    _np.random.seed(seed)
 
 
 def _state_dict_has_non_finite(state_dict):
@@ -102,8 +125,19 @@ class RunnerBase:
         self._scaler = None
         self._dataloaders = None
         self._lr_sched = None
+        # Dedicated RNG for the train DataLoader (shuffling + worker seeding).
+        # Kept off the global torch stream so batch order is reproducible even
+        # if the model's forward consumes a different number of random draws.
+        self._train_generator = None
 
         self.start_epoch = 0
+        # Optimizer-update counters. `optimizer_step` counts successful
+        # optimizer.step() calls in this process; `global_step` counts
+        # micro-batches consumed. Both are persisted and restored so a resumed
+        # run reports the same position on the schedule as a continuous one.
+        self.optimizer_step = 0
+        self.global_step = 0
+        self.micro_step = 0
 
         # self.setup_seeds()
         self.setup_output_dir()
@@ -147,8 +181,14 @@ class RunnerBase:
             # distributed training wrapper
             if self.use_distributed:
                 if self._wrapped_model is None:
+                    # run_cfg.gpu is LOCAL_RANK (set in init_distributed_mode),
+                    # never the global rank. output_device is stated explicitly
+                    # so DDP does not fall back to guessing it.
+                    local_rank = int(self.config.run_cfg.gpu)
                     self._wrapped_model = DDP(
-                        self._model, device_ids=[self.config.run_cfg.gpu],
+                        self._model,
+                        device_ids=[local_rank],
+                        output_device=local_rank,
                         find_unused_parameters=bool(
                             self.config.run_cfg.get("find_unused_parameters", False)
                         ),
@@ -433,6 +473,32 @@ class RunnerBase:
         return self.config.run_cfg.get("resume_ckpt_path", None)
 
     @property
+    def resume_mode(self):
+        """``strict`` (default) or ``best_effort``.
+
+        ``strict`` means "this resume must be indistinguishable from an
+        uninterrupted run" and fails loudly on any state it cannot restore.
+        ``best_effort`` restores what it can and labels the result PARTIAL.
+        """
+        return normalize_resume_mode(self.config.run_cfg.get("resume_mode", "strict"))
+
+    @property
+    def deterministic(self):
+        return bool(self.config.run_cfg.get("deterministic", False))
+
+    @property
+    def persistent_workers(self):
+        # Must not differ between the continuous and the resumed run: persistent
+        # workers keep their RNG across epochs, non-persistent ones are re-seeded
+        # from the loader generator on every `iter()`.
+        default = self.config.run_cfg.num_workers > 0
+        return bool(self.config.run_cfg.get("persistent_workers", default))
+
+    @property
+    def seed(self):
+        return int(self.config.run_cfg.seed)
+
+    @property
     def run_role(self):
         # "preflight" for the 2-step DDP smoke probe, "train" for the real run.
         # Purely a logging label so preflight's fresh epoch-0 pass is never
@@ -520,8 +586,43 @@ class RunnerBase:
         self.result_dir = result_dir
         self.output_dir = output_dir
 
+    def _train_loader_generator(self):
+        if self._train_generator is None:
+            gen = torch.Generator()
+            # Same offset convention as setup_seeds(): every rank gets its own
+            # stream, and the stream is a deterministic function of run.seed.
+            gen.manual_seed(self.seed + get_rank())
+            self._train_generator = gen
+        return self._train_generator
+
+    @staticmethod
+    def _nonpersistent_buffers(model):
+        """Model state that ``state_dict()`` deliberately omits.
+
+        ``Blip2Qformer`` registers the ITC negative queue, its write pointer and
+        its fill counter with ``persistent=False``, so none of them appear in
+        ``state_dict()`` and none were ever checkpointed. A resumed run therefore
+        restarted ITC from an empty queue while a continuous run had 1,024
+        negatives in flight -- a different loss for the whole refill window.
+        Collecting them by difference (rather than by name) also covers any
+        future EMA/momentum/running buffer registered the same way.
+
+        The queue is filled from ``concat_all_gather``, so every rank holds an
+        identical copy; saving one rank's view and restoring it everywhere is
+        correct, not a rank-0 leak.
+        """
+        persistent = set(model.state_dict().keys())
+        return {
+            name: buf.detach().cpu().clone()
+            for name, buf in model.named_buffers()
+            if name not in persistent
+        }
+
     def _checkpoint_identity(self):
         return build_checkpoint_identity(self.config.run_cfg)
+
+    def _runtime_contract(self):
+        return build_runtime_contract(self.config.run_cfg, get_world_size())
 
     def _load_trainable_state(self, model, state_dict, checkpoint_path):
         model_state = model.state_dict()
@@ -840,7 +941,7 @@ class RunnerBase:
         # train
         self.model.train()
 
-        return self.task.train_epoch(
+        stats = self.task.train_epoch(
             epoch=epoch,
             model=self.model,
             data_loader=self.train_loader,
@@ -853,6 +954,13 @@ class RunnerBase:
             max_grad_norm=self.max_grad_norm,
             run_role=self.run_role,
         )
+        # Advance the persisted training position by what the epoch ACTUALLY did
+        # (dropped windows and skipped AMP steps are excluded), so the counters
+        # in the checkpoint describe the optimizer's real trajectory.
+        self.optimizer_step += int(stats.get("optimizer_steps_taken", 0))
+        self.global_step += int(stats.get("micro_steps_taken", 0))
+        self.micro_step = 0  # epoch boundary: no partially accumulated window
+        return stats
 
     @torch.no_grad()
     def eval_epoch(self, split_name, cur_epoch, skip_reload=False):
@@ -954,7 +1062,19 @@ class RunnerBase:
                     collate_fn=collate_fn,
                     drop_last=True if is_train else False,
                 )
+                if is_train:
+                    # An explicit, per-rank-seeded generator: it drives shuffling
+                    # (when no DistributedSampler) and, more importantly, the
+                    # base seed each worker derives its own Python/NumPy/torch
+                    # seeds from. Without it DataLoader draws that base seed from
+                    # the *global* torch RNG, so any change in how many random
+                    # numbers the model consumed re-seeds the workers and changes
+                    # augmentation. Its state is saved and restored with the
+                    # checkpoint (see capture_rng_state).
+                    loader_kwargs["generator"] = self._train_loader_generator()
+                    loader_kwargs["worker_init_fn"] = _seed_dataloader_worker
                 if num_workers > 0:
+                    loader_kwargs["persistent_workers"] = self.persistent_workers
                     loader_kwargs["prefetch_factor"] = 2
                     # Bound per-batch worker fetch time so a stalled/hung image
                     # read raises RuntimeError instead of blocking next(loader)
@@ -1013,12 +1133,18 @@ class RunnerBase:
             # Snapshot every rank's RNG (all_gather_object is a collective, so it
             # must run on every rank before the main-process early-return below),
             # then index by rank on resume. This keeps each rank's RNG its own.
-            local_rng = capture_rng_state()
+            local_rng = capture_rng_state(self._train_generator)
             if dist.is_available() and dist.is_initialized():
                 rng_state = [None] * get_world_size()
                 dist.all_gather_object(rng_state, local_rng)
             else:
                 rng_state = [local_rng]
+            # Scaler health must be decided on EVERY rank before the
+            # main-process early-return below: each rank owns its own scaler, and
+            # in strict mode an unhealthy one raises. Raising on rank 0 alone
+            # would leave the peers blocked on the next collective until the NCCL
+            # watchdog fires, so agree via all_reduce and fail together.
+            self._assert_scaler_saveable(include_training_state)
         if not is_main_process():
             return
         save_to = os.path.join(
@@ -1047,6 +1173,10 @@ class RunnerBase:
             "model": state_dict,
             "config": self.config.to_dict(),
             "identity": self._checkpoint_identity(),
+            # Everything outside `identity` that a strict resume must find
+            # unchanged (world size, batch size, accumulation, seed, AMP,
+            # optimizer/scheduler hyperparameters).
+            "runtime_contract": self._runtime_contract(),
             # Provenance only: records which commit produced the weights, but is
             # NOT part of the resume identity check, so a plumbing-only commit
             # does not strand the checkpoint.
@@ -1063,29 +1193,46 @@ class RunnerBase:
         scaler_healthy = None
         if include_training_state:
             save_obj["optimizer"] = optimizer_state
+            # The LAVIS schedulers are stateless (LR is recomputed from
+            # epoch/step), so this is their defining configuration rather than a
+            # running counter. Restoring it means verifying it still matches.
+            save_obj["scheduler"] = scheduler_state(self.lr_scheduler)
+            save_obj["lr_by_group"] = {
+                str(group.get("name", idx)): float(group["lr"])
+                for idx, group in enumerate(self.optimizer.param_groups)
+            }
             scaler_state = self.scaler.state_dict() if self.scaler else None
             if scaler_state is not None:
                 status, scale_val = scaler_state_health(scaler_state)
                 scaler_healthy = status == "healthy"
                 if not scaler_healthy:
-                    # A degenerate/non-finite scaler means AMP collapsed this
-                    # epoch (repeated fp16 overflow drove scale->0), so the
-                    # optimizer barely advanced. Persist a FRESH scaler instead
-                    # of a dead one so the resume anchor stays usable, and flag
-                    # it loudly rather than silently shipping scale=0.
+                    # Only reachable in best_effort: strict already raised in
+                    # _assert_scaler_saveable, on every rank. Persist a reset
+                    # scaler so the run keeps a resume anchor, and record
+                    # scaler_healthy=False so the loader knows the scale on disk
+                    # is NOT the one the run was using.
                     logging.error(
                         "GradScaler is %s at save time (scale=%s): AMP has "
                         "collapsed from repeated fp16 gradient overflow. Saving a "
-                        "reset scaler so resume can recover; investigate fp16 "
-                        "stability (loss scale / encoder output magnitudes).",
+                        "reset scaler (resume_mode=best_effort) so resume can "
+                        "recover; investigate fp16 stability.",
                         status, scale_val,
                     )
                     scaler_state = self._fresh_scaler_state()
+            # ITC negative queue + pointer + fill counter (and any other
+            # non-persistent buffer). Absent from state_dict by construction.
+            save_obj["nonpersistent_buffers"] = self._nonpersistent_buffers(model_no_ddp)
             save_obj["scaler"] = scaler_state
             save_obj["scaler_healthy"] = scaler_healthy
             save_obj["rng_by_rank"] = rng_state
-            # Observability only (the stateless scheduler recomputes LR from the
-            # epoch, so resume does not depend on these counters).
+            # Training position. `micro_step` is 0 by construction: checkpoints
+            # are only ever written at an epoch boundary, i.e. after the last
+            # optimizer step of the epoch completed and grads were zeroed. It is
+            # recorded explicitly so a future mid-epoch checkpoint cannot be
+            # mistaken for an epoch-boundary one.
+            save_obj["global_step"] = int(self.global_step)
+            save_obj["optimizer_step"] = int(self.optimizer_step)
+            save_obj["micro_step"] = int(self.micro_step)
             try:
                 steps_per_epoch = math.ceil(
                     len(self.train_loader) / max(self.accum_grad_iters, 1)
@@ -1096,13 +1243,13 @@ class RunnerBase:
                 pass
         logging.info(
             "Saving checkpoint | version=%d | role=%s | completed_epoch=%d | "
-            "next_epoch=%d | scaler_healthy=%s | global_step=%s | path=%s",
+            "next_epoch=%d | scaler_healthy=%s | optimizer_step=%s | path=%s",
             CHECKPOINT_VERSION,
             self.run_role,
             cur_epoch,
             cur_epoch + 1,
             scaler_healthy,
-            save_obj.get("global_optimizer_step"),
+            save_obj.get("optimizer_step"),
             save_to,
         )
         # Atomic write (Task H #12): a crash or OOM mid-torch.save would leave a
@@ -1115,6 +1262,40 @@ class RunnerBase:
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp_to, save_to)
+
+    def _assert_scaler_saveable(self, include_training_state):
+        """In strict mode, refuse to checkpoint a collapsed GradScaler.
+
+        Writing a checkpoint whose scaler is dead (``scale == 0``) is what
+        produced the original symptom: the loader could only either restore a
+        scale of 0 -- which skips every subsequent optimizer step forever -- or
+        silently reset it, which is a different trajectory than the continuous
+        run. Neither is a strict resume, so the honest action is to not write the
+        checkpoint and keep the previous good one.
+
+        The decision is all-reduced so every rank raises together.
+        """
+        if not include_training_state or self.scaler is None:
+            return
+        status, scale_val = scaler_state_health(self.scaler.state_dict())
+        unhealthy = 0.0 if status == "healthy" else 1.0
+        if dist.is_available() and dist.is_initialized():
+            flag = torch.tensor([unhealthy], dtype=torch.float64, device=self.device)
+            dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+            unhealthy = float(flag.item())
+        if unhealthy <= 0:
+            return
+        if self.resume_mode == "strict":
+            raise RuntimeError(
+                f"Refusing to save a checkpoint under run.resume_mode=strict: "
+                f"GradScaler on rank {get_rank()} is {status} (scale={scale_val}); "
+                "at least one rank has a collapsed scaler. AMP has broken down "
+                "from repeated fp16 gradient overflow, so no checkpoint written "
+                "now can reproduce an uninterrupted run. Investigate fp16 "
+                "stability (loss magnitude, encoder output range), lower "
+                "run.init_lr, or disable run.amp. Set run.resume_mode=best_effort "
+                "to accept a knowingly PARTIAL resume anchor instead."
+            )
 
     def _fresh_scaler_state(self):
         """A pristine GradScaler state_dict, matching the runner's scaler ctor."""
@@ -1164,16 +1345,52 @@ class RunnerBase:
         else:
             raise RuntimeError("checkpoint url or path is invalid")
 
-        # Accumulates any state that could NOT be restored faithfully, so the
-        # end-of-load banner can honestly report FULL vs PARTIAL resume instead
-        # of pretending everything came back.
-        resume_partial_reasons = []
+        # Accumulates what could and could NOT be restored faithfully, so the
+        # end-of-load banner reports FULL vs PARTIAL honestly instead of
+        # pretending everything came back. In strict mode any entry in
+        # `report.missing` becomes a RuntimeError before training starts.
+        report = ResumeReport(self.resume_mode)
+        report.ok("checkpoint", str(url_or_filename))
+        report.ok("checkpoint_version", str(checkpoint.get("checkpoint_version", "legacy_v1")))
 
         state_dict = checkpoint["model"]
         expected_identity = self._checkpoint_identity()
         assert_checkpoint_identity(
             checkpoint.get("identity"), expected_identity, "Resume"
         )
+        report.ok("dataset_manifest", "matched")
+        report.ok("config_fingerprint", "matched")
+
+        # source_commit is provenance, not identity (a plumbing-only commit must
+        # not strand a checkpoint). Strict resume still reports a mismatch,
+        # because "the code changed under the optimizer" is exactly the kind of
+        # thing that silently breaks equivalence with a continuous run.
+        saved_commit = checkpoint.get("source_commit")
+        current_commit = self.config.run_cfg.get("source_commit")
+        if saved_commit == current_commit:
+            report.ok("source_commit", "matched")
+        else:
+            report.fail(
+                "source_commit",
+                f"mismatch (checkpoint={saved_commit}, current={current_commit})",
+            )
+
+        contract_diff = diff_states(
+            checkpoint.get("runtime_contract"), self._runtime_contract()
+        )
+        if checkpoint.get("runtime_contract") is None:
+            report.fail("runtime_contract", "absent (checkpoint predates v3)")
+        elif contract_diff:
+            saved_contract = checkpoint["runtime_contract"]
+            current_contract = self._runtime_contract()
+            detail = ", ".join(
+                f"{k}: {saved_contract.get(k)!r}->{current_contract.get(k)!r}"
+                for k in contract_diff
+            )
+            report.fail("runtime_contract", f"mismatch ({detail})")
+        else:
+            report.ok("runtime_contract", "matched")
+
         model_bad, model_bad_count = _state_dict_has_non_finite(state_dict)
         if model_bad:
             logging.warning(
@@ -1181,8 +1398,43 @@ class RunnerBase:
                 "loading anyway but training may need to recover via the NaN-loss guard."
             )
         model = self.unwrap_dist_model(self.model)
+        # _load_trainable_state raises on any unexpected key, any shape mismatch,
+        # and any missing *trainable* tensor. Frozen tensors are absent by
+        # design (the save path strips them), so this is the strict-equivalent
+        # check for the subset the checkpoint actually claims to carry.
         self._load_trainable_state(model, state_dict, url_or_filename)
-        
+        report.ok("model", "strict-loaded (trainable tensors)")
+
+        # Non-persistent buffers (ITC queue / pointer / fill counter). Without
+        # these the resumed run's contrastive loss differs from the continuous
+        # run's until the queue refills.
+        expected_aux = self._nonpersistent_buffers(model)
+        saved_aux = checkpoint.get("nonpersistent_buffers")
+        if expected_aux and saved_aux is None:
+            report.fail(
+                "nonpersistent_buffers",
+                f"absent from checkpoint but the model has {len(expected_aux)}: "
+                + ", ".join(sorted(expected_aux)),
+            )
+        elif expected_aux:
+            missing = sorted(set(expected_aux) - set(saved_aux))
+            extra = sorted(set(saved_aux) - set(expected_aux))
+            if missing or extra:
+                report.fail(
+                    "nonpersistent_buffers",
+                    f"missing={missing} unexpected={extra}",
+                )
+            else:
+                buffers = dict(model.named_buffers())
+                for name, value in saved_aux.items():
+                    buffers[name].copy_(value.to(buffers[name].device))
+                report.ok(
+                    "nonpersistent_buffers",
+                    f"loaded ({len(saved_aux)}: {', '.join(sorted(saved_aux))})",
+                )
+        else:
+            report.ok("nonpersistent_buffers", "n/a (model has none)")
+
         finetune_classifier = self.config.run_cfg.get("finetune_classifier", False)
         if finetune_classifier:
             print("Unfreezing classifier parameters.")
@@ -1218,8 +1470,12 @@ class RunnerBase:
 
         # Initialize the optimizer using the property
         optimizer = self.optimizer
-        
-        print(summary(self.model, input_size=None, device='cpu'))
+
+        # Main rank only. setup_for_distributed already suppresses print() on
+        # non-main ranks, but summary() was still *computed* on every rank --
+        # duplicated work, and the aggregate summary belongs to rank 0 alone.
+        if is_main_process():
+            print(summary(self.model, input_size=None, device='cpu'))
 
         # Skip loading optimizer state if it contains NaN/Inf (poisoned Adam
         # moments would corrupt model weights on the first update). Letting
@@ -1228,7 +1484,7 @@ class RunnerBase:
         optimizer_state = checkpoint.get("optimizer")
         if optimizer_state is None:
             logging.warning("Optimizer state missing from checkpoint; optimizer will be re-initialized.")
-            resume_partial_reasons.append("optimizer(missing)")
+            report.fail("optimizer", "missing from checkpoint")
         else:
             opt_bad, opt_bad_count = _state_dict_has_non_finite(optimizer_state)
             if opt_bad:
@@ -1236,7 +1492,7 @@ class RunnerBase:
                     f"Optimizer state contains {opt_bad_count} non-finite tensor(s) — "
                     "skipping load. Optimizer will be re-initialized."
                 )
-                resume_partial_reasons.append("optimizer(nonfinite)")
+                report.fail("optimizer", f"{opt_bad_count} non-finite tensor(s)")
             else:
                 try:
                     optimizer.load_state_dict(optimizer_state)
@@ -1244,27 +1500,74 @@ class RunnerBase:
                     raise RuntimeError(
                         "Optimizer state is incompatible with this exact run"
                     ) from exc
+                saved_groups = optimizer_state.get("param_groups", [])
+                if len(saved_groups) != len(optimizer.param_groups):
+                    report.fail(
+                        "optimizer",
+                        f"param group count {len(saved_groups)} != "
+                        f"{len(optimizer.param_groups)}",
+                    )
+                else:
+                    adam_steps = sum(
+                        1 for s in optimizer.state.values() if "exp_avg" in s
+                    )
+                    report.ok(
+                        "optimizer",
+                        f"loaded ({len(saved_groups)} groups, "
+                        f"{adam_steps} tensors with Adam moments)",
+                    )
+
+        # The scheduler is stateless: its LR is recomputed from (epoch, step) and
+        # its constructor config. So "restoring" it means proving that config is
+        # unchanged -- the scheduler_max_epoch=10 -> max_epoch=2 trap silently
+        # rewrites the entire cosine curve otherwise.
+        saved_sched = checkpoint.get("scheduler")
+        current_sched = scheduler_state(self.lr_scheduler)
+        if saved_sched is None:
+            report.fail("scheduler", "absent (checkpoint predates v3)")
+        else:
+            sched_diff = diff_states(saved_sched, current_sched)
+            if sched_diff:
+                detail = ", ".join(
+                    f"{k}: {saved_sched.get(k)!r}->{current_sched.get(k)!r}"
+                    for k in sched_diff
+                )
+                report.fail("scheduler", f"config changed ({detail})")
+            else:
+                report.ok(
+                    "scheduler",
+                    f"loaded (stateless, {current_sched['class']}, "
+                    f"max_epoch={current_sched.get('max_epoch')}, "
+                    f"warmup_steps={current_sched.get('warmup_steps')})",
+                )
 
         scaler_status = "n/a"
-        if self.scaler is not None:
+        if self.scaler is None:
+            report.ok("scaler", "n/a (amp disabled)")
+        else:
             scaler_state = checkpoint.get("scaler")
             # Old (v1) checkpoints have no scaler_healthy flag; assume healthy so
-            # a valid pre-v2 scaler still loads. v2 refuses to persist a dead
-            # scaler, so scaler_healthy=False means "was reset at save time".
+            # a valid pre-v2 scaler still loads. v2+ never persists a dead scaler
+            # without setting the flag, so scaler_healthy=False means "was reset
+            # at save time" -- which is NOT the scale the run was training with.
             saved_healthy = checkpoint.get("scaler_healthy", True)
             scaler_status, scaler_scale = scaler_state_health(scaler_state)
             if scaler_status == "healthy" and saved_healthy:
                 self.scaler.load_state_dict(scaler_state)
+                report.ok("scaler", "loaded")
+                report.ok("scaler_scale", str(scaler_scale))
             else:
                 logging.warning(
                     "GradScaler NOT restored (state=%s, saved_healthy=%s, "
-                    "scale=%s); AMP starts from a fresh scale. This is a PARTIAL "
-                    "resume for the scaler only — model/optimizer/RNG continuity "
-                    "is unaffected. A degenerate scaler indicates prior fp16 "
-                    "overflow, not a resume bug.",
+                    "scale=%s); AMP would start from a fresh scale, which is a "
+                    "different trajectory than an uninterrupted run.",
                     scaler_status, saved_healthy, scaler_scale,
                 )
-                resume_partial_reasons.append(f"scaler({scaler_status})")
+                report.fail(
+                    "scaler",
+                    f"not restored (state={scaler_status}, "
+                    f"saved_healthy={saved_healthy}, scale={scaler_scale})",
+                )
 
         # Each rank restores its OWN saved RNG slice (rank 0's state must not
         # leak onto rank 1). restore_rng_state coerces the tensors back to CPU
@@ -1274,8 +1577,19 @@ class RunnerBase:
         rank = get_rank()
         if not isinstance(rng_by_rank, list) or rank >= len(rng_by_rank):
             raise RuntimeError("Resume checkpoint is missing rank-specific RNG state")
+        if len(rng_by_rank) != get_world_size():
+            report.fail(
+                "rng",
+                f"checkpoint has {len(rng_by_rank)} rank slice(s) but world_size "
+                f"is {get_world_size()}",
+            )
         try:
-            restored = restore_rng_state(rng_by_rank[rank])
+            # The generator is restored here, before any iter(train_loader) is
+            # created (that only happens inside train_epoch, via
+            # IterLoader.set_epoch at the top of the epoch loop).
+            restored = restore_rng_state(
+                rng_by_rank[rank], generator=self._train_loader_generator()
+            )
         except (TypeError, KeyError) as exc:
             # Structurally invalid RNG dict is a real bug, not a "resume anyway"
             # situation -- surface it instead of silently reseeding.
@@ -1289,12 +1603,39 @@ class RunnerBase:
                 "streams continue from a fresh seed — PARTIAL resume.",
                 rank, rng_failed, sorted(n for n, ok in restored.items() if ok),
             )
-            resume_partial_reasons.append(f"rng[rank{rank}]:{'+'.join(rng_failed)}")
+            report.fail(f"rng_rank_{rank}", f"not restored: {'+'.join(rng_failed)}")
         else:
             logging.info(
-                "Rank %d: all RNG streams (python/numpy/torch/cuda) restored.",
+                "Rank %d: all RNG streams (python/numpy/torch/cuda/dataloader) restored.",
                 rank,
             )
+            report.ok(f"rng_rank_{rank}", "loaded")
+        # Called out separately from the rng_rank_N line: it is the stream that
+        # decides batch order and worker seeds, and it is the one most likely to
+        # be absent (checkpoints written before v3 carry no generator state).
+        if restored.get("dataloader_generator"):
+            report.ok("dataloader_generator", "loaded")
+        else:
+            report.fail("dataloader_generator", "not restored")
+
+        # Training-position counters. `micro_step != 0` means the checkpoint was
+        # taken mid-accumulation-window, which this runner never does and cannot
+        # replay -- the partially accumulated gradients are not in the file.
+        self.global_step = int(checkpoint.get("global_step", 0) or 0)
+        self.optimizer_step = int(checkpoint.get("optimizer_step", 0) or 0)
+        self.micro_step = int(checkpoint.get("micro_step", 0) or 0)
+        if "optimizer_step" not in checkpoint:
+            report.fail("optimizer_step", "absent (checkpoint predates v3)")
+        else:
+            report.ok("global_step", str(self.global_step))
+            report.ok("optimizer_step", str(self.optimizer_step))
+            report.ok("micro_step", str(self.micro_step))
+            if self.micro_step != 0:
+                report.fail(
+                    "micro_step",
+                    f"{self.micro_step} != 0: checkpoint was taken mid-window; "
+                    "the accumulated gradients are not recoverable",
+                )
 
         # `epoch` is the last COMPLETED epoch; resume must start at the NEXT one.
         # Prefer the explicit v2 next_epoch; fall back to epoch+1 for v1.
@@ -1311,37 +1652,57 @@ class RunnerBase:
         self._resumed_best_metric = checkpoint.get("best_agg_metric", None)
         self._resumed_best_epoch = checkpoint.get("best_epoch", None)
 
-        resume_kind = "FULL" if not resume_partial_reasons else "PARTIAL"
-        logging.info(
-            "===== RESUME %s | path=%s | version=%s | last_completed_epoch=%d | "
-            "start_epoch=%d | max_epoch=%d | scaler=%s | global_step=%s | "
-            "best_agg_metric=%s | best_epoch=%s%s =====",
-            resume_kind,
-            url_or_filename,
-            checkpoint.get("checkpoint_version", "legacy_v1"),
-            saved_epoch,
-            self.start_epoch,
-            self.max_epoch,
-            scaler_status,
-            checkpoint.get("global_optimizer_step"),
-            self._resumed_best_metric,
-            self._resumed_best_epoch,
-            "" if not resume_partial_reasons else f" | partial={resume_partial_reasons}",
-        )
-        # Guaranteed-visible echo on the main rank: the environment filters INFO
-        # (only WARNING+ shows), so the logging.info banner above never reaches
-        # the notebook — that is exactly why a resumed run "does not show" its
-        # starting epoch. print(flush=True) bypasses both the log level and any
-        # stdout buffering.
-        if is_main_process():
-            print(
-                f"===== RESUME {resume_kind} | last_completed_epoch={saved_epoch} | "
-                f"start_epoch={self.start_epoch} | max_epoch={self.max_epoch} | "
-                f"scaler={scaler_status} =====",
-                flush=True,
+        # The resumed LR must equal the LR the checkpoint was saved at. The
+        # scheduler recomputes it at the top of each accumulation window, so this
+        # verifies the *stored* optimizer LR round-tripped, catching a scheduler
+        # or param-group change that survived the config comparisons above.
+        saved_lr = checkpoint.get("lr_by_group")
+        loaded_lr = {
+            str(group.get("name", idx)): float(group["lr"])
+            for idx, group in enumerate(self.optimizer.param_groups)
+        }
+        if saved_lr is None:
+            report.fail("lr_by_group", "absent (checkpoint predates v3)")
+        elif diff_states(saved_lr, loaded_lr):
+            report.fail(
+                "lr_by_group",
+                f"saved_lr={saved_lr} != loaded_lr={loaded_lr}",
             )
+        else:
+            report.ok("saved_lr", str(saved_lr))
+            report.ok("loaded_lr", str(loaded_lr))
+
+        report.ok("last_completed_epoch", str(saved_epoch))
+        report.ok("start_epoch", str(self.start_epoch))
+        report.ok("sampler_epoch", str(self.start_epoch))
+        report.ok("max_epoch", str(self.max_epoch))
+        report.ok("best_agg_metric", str(self._resumed_best_metric))
+        report.ok("best_epoch", str(self._resumed_best_epoch))
+
+        banner = report.render()
+        logging.info("\n%s", banner)
+        # Guaranteed-visible echo on the main rank only: the environment filters
+        # INFO (only WARNING+ shows), so the logging.info banner above never
+        # reaches the notebook — that is exactly why a resumed run "does not
+        # show" its starting epoch. print(flush=True) bypasses both the log level
+        # and any stdout buffering. Rank 1 stays silent so the block appears once.
+        if is_main_process():
+            print(banner, flush=True)
+        # Most checks read the same checkpoint file on every rank and so agree,
+        # but the RNG check is rank-local. All-reduce the verdict so a failure on
+        # rank 1 alone cannot leave rank 0 training on into the next collective
+        # (which would hang until the NCCL watchdog fires instead of failing).
         if dist.is_available() and dist.is_initialized():
+            verdict = torch.tensor(
+                [float(bool(report.missing))], dtype=torch.float64, device=self.device
+            )
+            dist.all_reduce(verdict, op=dist.ReduceOp.MAX)
+            if verdict.item() > 0 and not report.missing:
+                report.fail("peer_rank", "another rank reported an incomplete resume")
             dist.barrier()
+        # Raised AFTER the banner so the operator sees exactly which states were
+        # missing before the traceback.
+        report.raise_if_strict()
 
     def _delete_local_resume_checkpoint_after_load(self, checkpoint_path):
         if not checkpoint_path or is_url(checkpoint_path) or not os.path.isfile(checkpoint_path):

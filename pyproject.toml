@@ -40,6 +40,10 @@ testpaths = ["tests"]
 # tests/conftest.py resolve model/ and model/lavis/ without executing
 # model/lavis/__init__.py.
 addopts = "-q"
+markers = [
+    # Spawns real subprocesses (2-rank gloo DDP). Seconds, not milliseconds.
+    "slow: multi-process integration tests",
+]
 
 [tool.ruff]
 line-length = 100
