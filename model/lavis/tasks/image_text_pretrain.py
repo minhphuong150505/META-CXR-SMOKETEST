@@ -115,6 +115,18 @@ class ImageTextPretrainTask(BaseTask):
                 sample_mask, dtype=torch.bool, device=labels.device
             ).reshape(-1)
 
+            if classification_only:
+                # `forward_image` is the image-only student path and returns no
+                # loss, so with classification_only_eval the run had NO validation
+                # loss at all -- nothing for `selection_metric: loss_cls` to
+                # select on. Recompute it here with the same ClassificationLoss
+                # and the same per-sample mask the training step uses, so val and
+                # train report the same quantity.
+                loss_cls = model.cls_loss_fn(logits, labels, sample_mask=sample_mask)
+                loss_sums["loss_cls"] = (
+                    loss_sums.get("loss_cls", 0.0) + float(loss_cls) * batch_size
+                )
+
             metric_labels = labels.clone()
             label_mask = sample_mask[:, None] & (metric_labels >= 0)
             if uncertain_policy == "ignore_uncertain":

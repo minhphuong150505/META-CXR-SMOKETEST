@@ -314,3 +314,41 @@ def test_skipping_rng_restore_diverges_from_continuous():
     _run_epoch(net3, opt3, sched3, X, Y, 1, STEPS)
 
     assert not torch.allclose(w_continuous, net3.fc2.weight, atol=1e-6)
+
+
+# --------------------------------------------------------------------------- #
+# AMP scale policy                                                            #
+# --------------------------------------------------------------------------- #
+class _StubScaler:
+    def __init__(self, state):
+        self._state = dict(state)
+
+    def state_dict(self):
+        return dict(self._state)
+
+    def load_state_dict(self, state):
+        self._state = dict(state)
+
+
+def test_reset_scaler_scale_lifts_a_collapsed_scale_and_clears_growth():
+    from smoke.resume import AMP_INIT_SCALE, reset_scaler_scale
+
+    scaler = _StubScaler({"scale": 0.0, "_growth_tracker": 7, "growth_factor": 2.0})
+    previous = reset_scaler_scale(scaler)
+
+    assert previous == 0.0
+    assert scaler.state_dict()["scale"] == AMP_INIT_SCALE
+    assert scaler.state_dict()["_growth_tracker"] == 0
+    # Untouched fields survive: only the scale policy is rewritten.
+    assert scaler.state_dict()["growth_factor"] == 2.0
+
+
+def test_growth_interval_fits_inside_a_stage1_epoch():
+    """A growth interval longer than an epoch makes the scale one-way downward.
+
+    The production epoch is 10,509 micro-batches / accum_grad_iters 16 = 657
+    optimizer steps; torch's 2000-step default can never complete inside one.
+    """
+    from smoke.resume import AMP_GROWTH_INTERVAL
+
+    assert AMP_GROWTH_INTERVAL < 657

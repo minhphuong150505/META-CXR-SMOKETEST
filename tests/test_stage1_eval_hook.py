@@ -174,3 +174,58 @@ def test_predictions_are_not_saved_unless_requested(tmp_path):
     stats = run_evaluation(labels=[[1], [0]], predictions=[[1], [0]])
     assert "f1_positive_macro" in stats
     assert list(tmp_path.iterdir()) == []
+
+
+class FakeStudentModel(torch.nn.Module):
+    """The `classification_only_eval: true` path: forward_image, no loss."""
+
+    def __init__(self, logits, loss_value=0.25):
+        super().__init__()
+        self.logits = logits
+        self.loss_value = loss_value
+        self.seen_masks = []
+        self._parameter = torch.nn.Parameter(torch.zeros(1))
+
+    def forward_image(self, batch):
+        return self.logits, None
+
+    def cls_loss_fn(self, logits, labels, sample_mask=None):
+        self.seen_masks.append(sample_mask)
+        return torch.tensor(self.loss_value)
+
+
+def run_student_evaluation(labels, predictions, mask=None, loss_value=0.25):
+    batch = make_batch(labels, mask)
+    model = FakeStudentModel(logits_for(predictions), loss_value=loss_value)
+    task = ImageTextPretrainTask()
+    task.run_cfg = {"classification_only_eval": True}
+    return task.evaluation(model, [batch], cuda_enabled=False), model
+
+
+def test_classification_only_eval_reports_a_selection_loss():
+    """Without this, `selection_metric: loss_cls` has nothing to select on.
+
+    forward_image returns logits only, so before the loss was recomputed here the
+    validation stats carried no loss key at all.
+    """
+    stats, _ = run_student_evaluation(
+        labels=[[1, 0], [0, 1]], predictions=[[1, 0], [0, 1]], loss_value=0.5
+    )
+    assert stats["loss_cls"] == pytest.approx(0.5)
+
+
+def test_selection_loss_uses_the_same_mask_as_training():
+    """Rows without a CheXpert label are masked out of the loss, not counted."""
+    _, model = run_student_evaluation(
+        labels=[[1, 0], [0, 1]],
+        predictions=[[1, 0], [0, 1]],
+        mask=[True, False],
+    )
+    assert model.seen_masks[0].tolist() == [True, False]
+
+
+def test_full_forward_eval_still_reports_its_own_losses():
+    """classification_only_eval: false keeps the multi-objective loss keys."""
+    stats = run_evaluation(labels=[[1, 0], [0, 1]], predictions=[[1, 0], [0, 1]])
+    assert stats["loss"] == pytest.approx(1.0)
+    assert "loss_cls" not in stats

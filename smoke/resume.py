@@ -192,6 +192,52 @@ def scaler_state_health(state) -> tuple[str, float | None]:
 
 
 # --------------------------------------------------------------------------- #
+# AMP loss scale                                                               #
+# --------------------------------------------------------------------------- #
+# Torch's default ``growth_interval`` is 2000 *optimizer* steps, but a Stage-1
+# epoch is ~657 of them (10,509 micro-batches / accum_grad_iters=16).  The scale
+# can therefore only ever ratchet DOWN inside a run: every intermittent fp16
+# overflow halves it and it never gets the 2000 clean steps needed to grow back.
+# Run e123 walked 65536 -> 0 that way over two epochs, after which `scaler.step`
+# is a permanent no-op -- the weights stopped moving and both epochs reported
+# bit-identical validation metrics.  A growth interval well inside one epoch
+# lets the scale recover between spikes instead.
+AMP_INIT_SCALE = 2.0 ** 14
+AMP_GROWTH_INTERVAL = 200
+# Below 1.0 the "scale" shrinks gradients rather than protecting them from fp16
+# underflow, so halving further buys nothing and only walks the value down into
+# the subnormal range where it eventually becomes exactly 0.  Reset at this
+# floor instead.
+AMP_MIN_SCALE = 1.0
+
+
+def new_grad_scaler():
+    """A GradScaler with the project's scale policy (see the constants above)."""
+    try:
+        return torch.amp.GradScaler(
+            "cuda", init_scale=AMP_INIT_SCALE, growth_interval=AMP_GROWTH_INTERVAL
+        )
+    except (AttributeError, TypeError):  # torch < 2.4
+        return torch.cuda.amp.GradScaler(
+            init_scale=AMP_INIT_SCALE, growth_interval=AMP_GROWTH_INTERVAL
+        )
+
+
+def reset_scaler_scale(scaler) -> float:
+    """Lift a collapsed scaler back to ``AMP_INIT_SCALE`` in place.
+
+    Returns the scale that was replaced.  Used instead of letting the scale keep
+    halving toward 0, which freezes the optimizer for the rest of the run.
+    """
+    state = scaler.state_dict()
+    previous = float(state.get("scale", 0.0))
+    state["scale"] = float(AMP_INIT_SCALE)
+    state["_growth_tracker"] = 0
+    scaler.load_state_dict(state)
+    return previous
+
+
+# --------------------------------------------------------------------------- #
 # Scheduler                                                                    #
 # --------------------------------------------------------------------------- #
 # The LAVIS schedulers in ``model/lavis/common/optims.py`` are *stateless*: LR is
