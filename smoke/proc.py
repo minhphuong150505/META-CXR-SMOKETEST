@@ -3,8 +3,12 @@
 Task E: on Kaggle a lost notebook session used to take the final traceback with
 it, so a mid-training crash (e.g. one rank OOM-ing or its DataLoader stalling)
 left no evidence. `stream_and_capture` tees the child's merged stdout+stderr to
-the notebook in real time and to `<run_dir>/full_train_console.log`, prints the
-log path plus the tail on failure, and re-raises with the real return code.
+the notebook in real time and to `log_path`, prints the log path plus the tail
+on failure, and re-raises with the real return code. `log_path` is created
+before the subprocess starts, so callers whose command launches
+`RunnerBase.setup_output_dir` (pretraining.train) must point it outside that
+run's output_dir -- otherwise the pre-created log file makes the run directory
+look non-empty and the training process refuses to start.
 
 It never writes the environment (WandB / HF / GCS secrets live there); only the
 command list is logged, and that carries no secrets.
