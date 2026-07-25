@@ -81,10 +81,13 @@ run:
   warmup_steps: 1
   accum_grad_iters: 16
   max_grad_norm: 1.0
-  # Required: view_fusion is skipped for studies with no auxiliary view, and the
-  # lambda_mpc=0 / lambda_view_consistency=0 terms leave their params without
-  # gradients, so which parameters are used varies per sample and per rank. DDP
-  # rejects that unless unused-parameter detection is on.
+  # Kept true as a safe belt-and-suspenders alongside the zero-weighted param
+  # touch in blip2_qformer.forward(). The former data-dependent hazard --
+  # view_fusion being skipped on a micro-batch with no auxiliary view -- is fixed
+  # in Blip2Qformer._fuse (it now always runs the module on a zero auxiliary, so
+  # every rank uses the same parameter set in the same grad-ready order). This
+  # flag only adds a per-step graph traversal now; it is not what prevents the
+  # deadlock.
   find_unused_parameters: true
 
   max_len: 256

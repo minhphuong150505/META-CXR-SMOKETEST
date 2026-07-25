@@ -19,6 +19,56 @@ from model.lavis.common.registry import registry
 from model.lavis.datasets.data_utils import prepare_sample
 from torch.nn.utils import clip_grad_norm_
 
+# Opt-in per-rank DDP tracing. Off by default (production is unaffected); enable
+# with META_DDP_DEBUG=1 to pinpoint exactly which collective a resumed 2-GPU run
+# stalls on. Every marker flushes and (with sync=True) drives a cuda.synchronize
+# first, so a marker that fails to print localises the hang to the op just after
+# the last printed marker on that rank.
+_DDP_DEBUG = os.environ.get("META_DDP_DEBUG", "0").strip().lower() not in ("", "0", "false", "no")
+
+
+def _ddp_marker(tag, *, epoch=None, iter_idx=None, loss=None, batch_size=None,
+                extra="", sync=False):
+    if not _DDP_DEBUG:
+        return
+    if sync and torch.cuda.is_available():
+        torch.cuda.synchronize()
+    rank = get_rank()
+    local_rank = os.environ.get("LOCAL_RANK", "?")
+    dev = torch.cuda.current_device() if torch.cuda.is_available() else "cpu"
+    loss_str = ""
+    if loss is not None:
+        lv = loss.item() if torch.is_tensor(loss) else float(loss)
+        loss_str = f" loss={lv:.4f} finite={math.isfinite(lv)}"
+    bs_str = f" bs={batch_size}" if batch_size is not None else ""
+    extra_str = f" {extra}" if extra else ""
+    print(
+        f"[DDP_DBG rank{rank} lrank{local_rank} cuda:{dev}] {tag} "
+        f"epoch={epoch} iter={iter_idx}{loss_str}{bs_str}{extra_str}",
+        flush=True,
+    )
+
+
+def _batch_gate_summary(samples):
+    """Compact per-rank view of the branch gates that historically diverged."""
+    if not _DDP_DEBUG:
+        return ""
+    parts = []
+    img = samples.get("image")
+    if torch.is_tensor(img) and img.ndim > 0:
+        parts.append(f"bs={img.shape[0]}")
+    aux_mask = samples.get("aux_mask")
+    if torch.is_tensor(aux_mask):
+        parts.append(f"aux_any={bool(aux_mask.any().item()) if aux_mask.numel() else False}")
+    cls_mask = samples.get("classification_mask")
+    gen_mask = samples.get("generation_mask")
+    if torch.is_tensor(cls_mask) and torch.is_tensor(gen_mask):
+        parts.append(
+            f"teacher_any={bool((cls_mask.bool() & gen_mask.bool()).any().item())}"
+        )
+    return " ".join(parts)
+
+
 class BaseTask:
     def __init__(self, **kwargs):
         super().__init__()
@@ -230,10 +280,15 @@ class BaseTask:
             if i >= iters_per_epoch:
                 break
 
+            _ddp_marker("BEFORE_FETCH_BATCH", epoch=inner_epoch, iter_idx=i)
             samples = next(data_loader)
             batch_probe = samples.get("classification_labels", samples.get("image"))
+            local_bs = None
             if torch.is_tensor(batch_probe) and batch_probe.ndim > 0:
-                processed_examples += int(batch_probe.shape[0])
+                local_bs = int(batch_probe.shape[0])
+                processed_examples += local_bs
+            _ddp_marker("AFTER_FETCH_BATCH", epoch=inner_epoch, iter_idx=i,
+                        batch_size=local_bs)
 
             samples = prepare_sample(samples, cuda_enabled=cuda_enabled)
             samples.update(
@@ -280,7 +335,11 @@ class BaseTask:
                 else:
                     amp_context = contextlib.nullcontext()
                 with amp_context:
+                    _ddp_marker("BEFORE_FORWARD", epoch=inner_epoch, iter_idx=i,
+                                extra=_batch_gate_summary(samples), sync=True)
                     loss, loss_dict = self.train_step(model=model, samples=samples)
+                    _ddp_marker("AFTER_FORWARD", epoch=inner_epoch, iter_idx=i,
+                                loss=loss, sync=True)
                     # The final accumulation window is often shorter on the full
                     # dataset. Divide by its actual size so its update has the same
                     # scale as every complete window.
@@ -315,13 +374,18 @@ class BaseTask:
                         window_had_nonfinite = False
                     continue
 
+                _ddp_marker("BEFORE_BACKWARD", epoch=inner_epoch, iter_idx=i,
+                            loss=loss, sync=True)
                 if use_amp:
                     scaler.scale(scaled_loss).backward()
                 else:
                     scaled_loss.backward()
+                _ddp_marker("AFTER_BACKWARD", epoch=inner_epoch, iter_idx=i, sync=True)
 
             # update gradients every accum_grad_iters iterations
             if is_sync_step:
+                _ddp_marker("BEFORE_OPTIMIZER_STEP", epoch=inner_epoch, iter_idx=i,
+                            sync=True)
                 if use_amp:
                     # First unscale the gradients before clipping
                     scaler.unscale_(optimizer)
@@ -338,6 +402,8 @@ class BaseTask:
                 # inf/NaN from an AMP overflow persist across iters and corrupt
                 # all subsequent updates.
                 optimizer.zero_grad(set_to_none=True)
+                _ddp_marker("AFTER_OPTIMIZER_STEP", epoch=inner_epoch, iter_idx=i,
+                            sync=True)
 
             current_lr = optimizer.param_groups[0]["lr"]
             # print(f"current lr is {current_lr}")
