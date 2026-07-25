@@ -6,6 +6,7 @@
 """
 
 import argparse
+import logging
 import os
 import random
 
@@ -61,13 +62,49 @@ def setup_seeds(config):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
-    # benchmark autotunes cuDNN conv kernels for the fixed 448x448 input -- a
-    # real throughput win on the conv-heavy frozen encoders. It gives up exact
-    # bit-reproducibility of the loss curve, which resume identity does not
-    # depend on (that gates on dataset + config, not RNG-level determinism).
-    cudnn.benchmark = True
-    cudnn.deterministic = False
+    if config.run_cfg.get("deterministic", False):
+        # Exact-resume verification mode. Every source of run-to-run kernel
+        # nondeterminism is turned off so a resumed run can be compared bitwise
+        # against a continuous one. This is materially slower -- it is for the
+        # integration test and for debugging a resume, not for production
+        # throughput.
+        cudnn.benchmark = False
+        cudnn.deterministic = True
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        # CUBLAS needs a fixed workspace for deterministic GEMMs, and it reads
+        # the variable when the CUDA context is created -- setting it here would
+        # be too late, so require it from the launcher instead of pretending.
+        if torch.cuda.is_available():
+            if os.environ.get("CUBLAS_WORKSPACE_CONFIG") not in (":4096:8", ":16:8"):
+                raise RuntimeError(
+                    "run.deterministic=true requires CUBLAS_WORKSPACE_CONFIG=:4096:8 "
+                    "to be exported BEFORE the process starts (cuBLAS reads it at "
+                    "CUDA context creation). Prefix your torchrun command with it."
+                )
+        if os.environ.get("PYTHONHASHSEED") is None:
+            # Only a warning: PYTHONHASHSEED affects set/dict iteration order,
+            # which this pipeline does not use to build batches. Recorded so the
+            # report can say what was and was not pinned.
+            logging.warning(
+                "run.deterministic=true but PYTHONHASHSEED is unset; export "
+                "PYTHONHASHSEED=%s before launching for full reproducibility.",
+                config.run_cfg.seed,
+            )
+        # warn_only is NOT set: an op without a deterministic implementation must
+        # surface by name so it can be fixed or explicitly documented, rather
+        # than being silently downgraded to "probably fine".
+        torch.use_deterministic_algorithms(True)
+    else:
+        # benchmark autotunes cuDNN conv kernels for the fixed 448x448 input -- a
+        # real throughput win on the conv-heavy frozen encoders. It gives up exact
+        # bit-reproducibility of the loss curve, which resume identity does not
+        # depend on (that gates on dataset + config, not RNG-level determinism).
+        cudnn.benchmark = True
+        cudnn.deterministic = False
 
 
 def get_runner_class(cfg):
