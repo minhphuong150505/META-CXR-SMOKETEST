@@ -33,6 +33,7 @@ VISUAL_DIM = 1408
 
 from mhcac.loss import (
     ClassificationLoss,
+    graph_connected_zero,
     MultiPositiveContrastiveLoss,
     soft_target_kl_loss,
     view_consistency_loss,
@@ -657,7 +658,7 @@ class Blip2Qformer(Blip2Base):
             ~candidate_valid.unsqueeze(0), float("-inf")
         )
 
-        zero = image_features.sum() * 0.0
+        zero = graph_connected_zero(image_features)
         if not valid_mask.any():
             return (
                 zero,
@@ -691,7 +692,7 @@ class Blip2Qformer(Blip2Base):
         sim_i2t,
         sim_t2i,
     ):
-        zero = image_embeds.sum() * 0.0
+        zero = graph_connected_zero(image_embeds)
         # GLOBAL gate only. valid_all is gathered across ranks, so every rank
         # decides identically here. The old `not valid_mask.any()` term was
         # LOCAL: a rank whose own batch had no valid report returned here and
