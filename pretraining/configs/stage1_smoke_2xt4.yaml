@@ -110,13 +110,18 @@ run:
   deterministic: false
 
   uncertain_policy: ignore_uncertain
-  # Validation loss of the image-only student, computed by image_text_pretrain.py
-  # with the same ClassificationLoss and mask as the training step. `loss` (the
-  # full ITC+ITM+LM+cls objective) is only produced when classification_only_eval
-  # is false; switching to it also means paying for the text path at eval.
-  selection_metric: loss_cls
+  # Total validation loss (ITC+ITM+LM+cls+distill+...), i.e. the same objective
+  # training minimises -- this is what the pre-smoke setup selected on, via the
+  # old runner's `selection_metric` default of "loss".
+  # It requires the full eval forward: classification_only_eval calls
+  # forward_image, which returns logits only and no loss at all. The full
+  # forward runs collectives (ITC all_gather, ITM/teacher all_reduce), which is
+  # why DistributedEvalSampler pads every rank to the same batch count.
+  # `loss_cls` stays available in the stats if a classification-only selector is
+  # wanted later.
+  selection_metric: loss
   selection_mode: min
-  classification_only_eval: true
+  classification_only_eval: false
   save_predictions: false
   finalize_test: false
   evaluate: false
