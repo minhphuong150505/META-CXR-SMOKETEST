@@ -22,7 +22,7 @@ def test_training_config_is_exact_e123_multiview_policy():
     # Checkpoint selection is on the validation classification loss (min), not
     # on F1: the loss moves every epoch, while F1 can sit on a plateau for a
     # whole epoch and pick an arbitrary checkpoint.
-    assert config["run"]["selection_metric"] == "loss_cls"
+    assert config["run"]["selection_metric"] == "loss"
     assert config["run"]["selection_mode"] == "min"
     assert config["run"]["uncertain_policy"] == "ignore_uncertain"
 
