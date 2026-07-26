@@ -537,7 +537,10 @@ class BaseTask:
                         raise RuntimeError(
                             f"Non-finite gradient norm {float(grad_norm)} at "
                             f"epoch {inner_epoch} iter {i} without AMP; the "
-                            "update would corrupt every weight."
+                            "update would corrupt every weight. There is no "
+                            "loss scale in play here, so this is the backward "
+                            "pass itself:\n"
+                            + summarize_nonfinite_grads(model)
                         )
                     optimizer.step()
                     optimizer_steps += 1

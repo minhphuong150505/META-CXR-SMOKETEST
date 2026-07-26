@@ -103,7 +103,18 @@ run:
   num_beams: 1
   seed: 42
   output_dir: /kaggle/working/meta-cxr-output
-  amp: true
+  # fp32. T4 is Turing (sm_75) and has no bf16 tensor core, so bf16 -- the usual
+  # answer to fp16 range problems -- is not available here; fp32 has the same
+  # exponent range and is the stand-in. GradScaler only scales the loss and the
+  # gradients, never the forward activations, so an fp16 activation overflow
+  # produces non-finite gradients at *every* loss scale. That is exactly what
+  # run e123 showed (overflow at scale 0.5 as readily as at 16384), and it is
+  # the one hypothesis the scaler cannot rule out. Running fp32 settles it: if
+  # the gradients are finite, the cause was fp16 range; if they are still
+  # non-finite, the cause is structural and summarize_nonfinite_grads names it.
+  # Costs roughly 2x step time and more activation memory, which is why
+  # BATCH_PER_GPU/ACCUMULATION move to 2/32 in nb01 (effective batch unchanged).
+  amp: false
 
   # strict  -> a resume must restore model + optimizer + scheduler + scaler +
   #            per-rank RNG + step counters, and the config/runtime contract must
