@@ -28,6 +28,54 @@ from torch.nn.utils import clip_grad_norm_
 _DDP_DEBUG = os.environ.get("META_DDP_DEBUG", "0").strip().lower() not in ("", "0", "false", "no")
 
 
+# How many non-finite-gradient reports to emit per epoch. The report walks every
+# parameter, so it is far too slow to run on every overflow -- but the first few
+# are all it takes to name the module, and after that the log just repeats.
+NAN_GRAD_REPORT_LIMIT = 3
+
+
+def summarize_nonfinite_grads(model, limit=8):
+    """Name the parameters whose gradient is not finite.
+
+    Called after ``scaler.unscale_``, so the gradients inspected here are at
+    their true magnitude. That is what makes the distinction worth logging: a
+    NaN at this point was produced by the backward pass itself and no loss
+    scale will ever fix it, whereas an Inf may still be fp16 range. The AMP
+    warning alone cannot tell the two apart -- it reports a non-finite norm
+    either way -- which is how a run can spend hours backing the scale off
+    against a NaN that was never about the scale.
+
+    ``named_parameters()`` yields in registration order, so the first name is
+    the earliest module in the graph holding a bad gradient.
+    """
+    nan_names, inf_names = [], []
+    with_grad = 0
+    for name, param in model.named_parameters():
+        grad = param.grad
+        if grad is None:
+            continue
+        with_grad += 1
+        if torch.isnan(grad).any():
+            nan_names.append(name)
+        elif torch.isinf(grad).any():
+            inf_names.append(name)
+
+    lines = [
+        f"  parameters holding a gradient: {with_grad}",
+        f"  nan: {len(nan_names)}   inf: {len(inf_names)}",
+    ]
+    if nan_names:
+        lines.append("  first nan: " + ", ".join(nan_names[:limit]))
+    if inf_names:
+        lines.append("  first inf: " + ", ".join(inf_names[:limit]))
+    if not nan_names and not inf_names:
+        lines.append(
+            "  none -- every individual gradient is finite, so the norm itself "
+            "overflowed while reducing them"
+        )
+    return "\n".join(lines)
+
+
 def _ddp_marker(tag, *, epoch=None, iter_idx=None, loss=None, batch_size=None,
                 extra="", sync=False):
     if not _DDP_DEBUG:
@@ -283,6 +331,7 @@ class BaseTask:
         overflow_steps = 0
         consecutive_overflows = 0
         amp_collapse_resets = 0
+        nan_grad_reports = 0
 
         for i in metric_logger.log_every(range(iters_per_epoch), log_freq, header):
             # if using iter-based runner, we stop after iters_per_epoch iterations.
@@ -407,6 +456,20 @@ class BaseTask:
                         if max_grad_norm > 0
                         else None
                     )
+                    if (
+                        grad_norm is not None
+                        and not torch.isfinite(grad_norm)
+                        and nan_grad_reports < NAN_GRAD_REPORT_LIMIT
+                    ):
+                        nan_grad_reports += 1
+                        logging.error(
+                            "Non-finite gradient at epoch %s iter %d "
+                            "(report %d/%d, measured AFTER unscale_ so this is "
+                            "independent of the loss scale):\n%s",
+                            inner_epoch, i, nan_grad_reports,
+                            NAN_GRAD_REPORT_LIMIT,
+                            summarize_nonfinite_grads(model),
+                        )
                     old_scale = scaler.get_scale()
                     scaler.step(optimizer)
                     scaler.update()
