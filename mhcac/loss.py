@@ -403,7 +403,17 @@ class AbnormalitySpecificLoss(nn.Module):
             else:
                 unc_loss = zero
 
-            contrastive_loss += (pos_neg_loss + unc_loss)
+            # Out-of-place. `contrastive_loss` starts out as the very same
+            # tensor object as `zero`, and `zero` is what both branches above
+            # fall back to when a batch has no positives / no negatives / no
+            # uncertains for this abnormality. An in-place `+=` therefore
+            # mutated `zero` into the running total, so the next skipped gate
+            # added the accumulated loss back into itself: c -> 2c (one gate
+            # skipped) or 3c (both). Over 14 abnormalities that is 2**k growth,
+            # which is where the 387 / 827 / 7040 contrastive values came from --
+            # and with them the exploding grad norm, the AMP overflow, and a run
+            # that applied zero optimizer steps.
+            contrastive_loss = contrastive_loss + (pos_neg_loss + unc_loss)
 
         contrastive_loss = contrastive_loss / num_abnormalities
 

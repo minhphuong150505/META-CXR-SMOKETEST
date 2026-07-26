@@ -132,3 +132,50 @@ def test_noop_branches_return_a_real_zero_in_fp16(labels_missing):
 
     assert torch.isfinite(contrastive), "no-op branch produced a non-finite loss"
     assert float(contrastive.detach()) == 0.0
+
+
+# --------------------------------------------------------------------------- #
+# 3. The aliased accumulator (the actual run-e123 root cause)                   #
+# --------------------------------------------------------------------------- #
+def test_skipped_gates_do_not_amplify_the_accumulated_loss():
+    """`contrastive_loss` starts out as the *same tensor object* as `zero`, and
+    `zero` is the fallback both branches use when an abnormality has no
+    positives / no negatives / no uncertains in the batch. With an in-place
+    `+=` that made `zero` become the running total, so each later skipped gate
+    added the accumulated loss back into itself -- c -> 2c or 3c, i.e. 2**k
+    growth over 14 abnormalities. That is where 387 / 827 / 7040 came from.
+
+    Constructed so most abnormalities skip at least one gate: single-class
+    columns leave pos_indices or neg_indices empty.
+    """
+    module = _module()
+    reps, attn = _inputs()
+    labels = torch.zeros(reps.shape[0], NUM_ABNORMALITIES, dtype=torch.long)
+    # Only column 0 has all three classes; the other 13 are single-class, so
+    # both gates skip there -> 3x per column on the old in-place code.
+    labels[:, 0] = torch.tensor([1, 0, 2, 1, 1, 0, 2, 0])
+
+    _, _, contrastive, _ = module(reps, attn, labels)
+
+    bound = module.margin + AbnormalitySpecificLoss.MAX_UNCERTAIN_TERM
+    assert float(contrastive.detach()) <= bound
+
+
+def test_in_place_accumulation_onto_an_aliased_zero_is_the_amplifier():
+    """The mechanism itself, in four lines: this is what the fix removes."""
+    zero = torch.zeros(())
+    total = zero  # same object, exactly as `contrastive_loss = zero` was
+
+    total += torch.tensor(0.02)  # one abnormality contributes
+    assert float(zero) == pytest.approx(0.02), "in-place mutated the shared zero"
+
+    total += zero + zero  # a later abnormality skips BOTH gates -> 3x
+    assert float(total) == pytest.approx(0.06)
+
+    # Out-of-place leaves the fallback pristine, so a skipped gate adds nothing.
+    zero = torch.zeros(())
+    total = zero
+    total = total + torch.tensor(0.02)
+    total = total + (zero + zero)
+    assert float(zero) == 0.0
+    assert float(total) == pytest.approx(0.02)
