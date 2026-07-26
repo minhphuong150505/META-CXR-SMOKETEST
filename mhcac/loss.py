@@ -1,3 +1,5 @@
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -219,7 +221,33 @@ class AttentionPooling(nn.Module):
 
         return pooled_representations
 
+def graph_connected_zero(tensor):
+    """A zero scalar that still carries ``tensor`` into the autograd graph.
+
+    The obvious spelling, ``tensor.sum() * 0.0``, is a live fp16 hazard under
+    autocast: ``sum`` over ``[B, 14, 768]`` half-precision activations returns a
+    half scalar, and once the true sum passes 65504 it saturates to ``inf`` --
+    then ``inf * 0.0 == nan``.  That nan is returned as the *loss* from every
+    branch that has nothing to contribute (no positives in the batch, an empty
+    ``sample_mask``, ``labels=None``), so a purely bookkeeping value poisons the
+    total loss, the step is dropped by the non-finite guard in
+    ``BaseTask._train_inner_loop``, the AMP scale backs off, and the optimizer
+    never advances.  Accumulating in fp32 puts the intermediate 24 orders of
+    magnitude away from overflow while keeping the graph edge intact.
+    """
+    return tensor.sum(dtype=torch.float32) * 0.0
+
+
 class AbnormalitySpecificLoss(nn.Module):
+    # Bound on the returned contrastive term, per abnormality:
+    #   pos_neg_loss = relu(margin - (1 - sim)),  sim in [-1, 1]  ->  [0, margin]
+    #   unc_loss     = |mean(sim_unc_pos) - mean(sim_unc_neg)|    ->  [0, 2]
+    # Both operate on L2-normalised tokens, so the mean over abnormalities can
+    # never exceed margin + 2.  Anything larger is not a "high loss", it is a
+    # broken tensor -- which is what makes it worth asserting rather than
+    # clipping.
+    MAX_UNCERTAIN_TERM = 2.0
+
     def __init__(self, temperature=0.07, margin=0.7, d_embedding = 768, num_abnormalities = 14):
         """
         Modified InfoNCE Loss for abnormality-specific tokens.
@@ -319,7 +347,7 @@ class AbnormalitySpecificLoss(nn.Module):
         orth_loss = self.orthogonality_loss(common_representations)
         sparsity_loss = self.compute_weighted_sparsity_loss(attention_weights_list)
         
-        zero = common_representations.sum() * 0.0
+        zero = graph_connected_zero(common_representations)
         if labels is None:
             return pooled_representations_, orth_loss, zero, sparsity_loss
 
@@ -378,7 +406,29 @@ class AbnormalitySpecificLoss(nn.Module):
             contrastive_loss += (pos_neg_loss + unc_loss)
 
         contrastive_loss = contrastive_loss / num_abnormalities
-        
+
+        # A finite value above the analytic bound means the inputs are not what
+        # the formula assumes (un-normalised tokens, labels outside {0,1,2}, a
+        # corrupted pooled representation) -- not that the model is merely doing
+        # badly. Left un-checked it shows up much later and much less legibly, as
+        # an exploding grad norm that trips the AMP guard and silently freezes
+        # the optimizer. NaN/Inf are deliberately NOT caught here: the non-finite
+        # guard in BaseTask._train_inner_loop already skips those steps on every
+        # rank together, and raising on them instead would kill a run that the
+        # existing guard is designed to ride out.
+        bound = self.margin + self.MAX_UNCERTAIN_TERM
+        value = float(contrastive_loss.detach())
+        if math.isfinite(value) and value > bound + 1e-3:
+            raise RuntimeError(
+                f"AbnormalitySpecificLoss contrastive term {value:.4f} exceeds "
+                f"its analytic bound {bound:.4f} (margin={self.margin} + "
+                f"{self.MAX_UNCERTAIN_TERM}). Both terms are computed on "
+                "L2-normalised tokens, so this is impossible unless the inputs "
+                "are malformed. Check that pooled representations are finite "
+                f"and that labels only contain {{0,1,2}} (got "
+                f"{sorted(set(labels_for_loss.unique().tolist()))})."
+            )
+
         return pooled_representations_, orth_loss, contrastive_loss, sparsity_loss
 
 

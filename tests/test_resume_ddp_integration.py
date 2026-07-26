@@ -223,13 +223,22 @@ def _run_epoch(epoch, ddp_model, net, opt, sched, loader, sampler, scaler, probe
         "rng_hash_at_epoch_start": _rng_hash(),
         "scaler_scale_at_epoch_start": float(scaler.get_scale()),
         "lr_at_epoch_start": [g["lr"] for g in opt.param_groups],
+        # The ITC-queue stand-in, called out separately from model_hash: it is a
+        # NON-persistent buffer, so it is absent from state_dict() and a resume
+        # that forgot to checkpoint it would still match on every parameter.
+        "aux_queue_at_epoch_start": net.aux_queue.tolist(),
     }
     first_batch_ids = None
+    batch_order = []
+    lrs = []
     losses = []
     grad_norms = []
 
     for i in range(MICRO_BATCHES):
         batch = next(it)
+        # The whole epoch's order, not just the first batch: a generator restored
+        # one draw late still reproduces batch 0 and diverges afterwards.
+        batch_order.append(list(batch["study_id"]))
         if i == 0:
             first_batch_ids = list(batch["study_id"])
 
@@ -242,6 +251,10 @@ def _run_epoch(epoch, ddp_model, net, opt, sched, loader, sampler, scaler, probe
                 cur_step=i // ACCUM_GRAD_ITERS,
                 steps_per_epoch=updates_per_epoch,
             )
+            # Per-window LR for every group, so a resumed run that rebuilt the
+            # scheduler with a different horizon is caught at the window where
+            # the two curves first part, not only at the epoch boundary.
+            lrs.append([g["lr"] for g in opt.param_groups])
 
         ctx = torch.enable_grad() if is_sync_step else ddp_model.no_sync()
         with ctx:
@@ -272,9 +285,14 @@ def _run_epoch(epoch, ddp_model, net, opt, sched, loader, sampler, scaler, probe
 
     epoch_probe.update(
         first_batch_study_ids=first_batch_ids,
+        batch_order=batch_order,
+        lrs=lrs,
         losses=losses,
         grad_norms=grad_norms,
         model_hash_at_epoch_end=_model_hash(net),
+        optimizer_hash_at_epoch_end=_optimizer_hash(opt),
+        rng_hash_at_epoch_end=_rng_hash(),
+        aux_queue_at_epoch_end=net.aux_queue.tolist(),
         scaler_scale_at_epoch_end=float(scaler.get_scale()),
     )
     probes[f"epoch{epoch}"] = epoch_probe
@@ -458,18 +476,27 @@ def test_interrupted_ddp_run_matches_continuous_run(tmp_path):
         assert b["scaler_scale_at_epoch_start"] == a["scaler_scale_at_epoch_start"]
         assert b["scaler_scale_at_epoch_start"] > 0
 
-        # 5: first batch each rank sees must be identical, per rank.
+        # 5: the batch stream each rank sees must be identical, per rank, for
+        # the WHOLE epoch -- not just its first batch.
         assert b["first_batch_study_ids"] == a["first_batch_study_ids"]
+        assert b["batch_order"] == a["batch_order"], "batch order diverged mid-epoch"
 
-        # 6-8: the numbers the epoch produces.
+        # 6-8: the numbers the epoch produces, plus the LR at every
+        # accumulation window and the non-persistent queue at both ends.
+        assert b["lrs"] == a["lrs"], "per-window LR diverged"
         assert b["losses"] == a["losses"], "per-micro-batch losses diverged"
         assert b["grad_norms"] == a["grad_norms"]
+        assert b["aux_queue_at_epoch_start"] == a["aux_queue_at_epoch_start"]
+        assert b["aux_queue_at_epoch_end"] == a["aux_queue_at_epoch_end"]
 
         # 9-12: state after the first optimizer step, and at epoch end.
         assert b["model_hash_after_first_step"] == a["model_hash_after_first_step"]
         assert b["optimizer_hash_after_first_step"] == a["optimizer_hash_after_first_step"]
         assert b["lr_after_first_step"] == a["lr_after_first_step"]
         assert b["model_hash_at_epoch_end"] == a["model_hash_at_epoch_end"]
+        assert b["optimizer_hash_at_epoch_end"] == a["optimizer_hash_at_epoch_end"]
+        assert b["rng_hash_at_epoch_end"] == a["rng_hash_at_epoch_end"]
+        assert b["scaler_scale_at_epoch_end"] == a["scaler_scale_at_epoch_end"]
 
         # Counters and scheduler config.
         assert resumed[rank]["optimizer_step"] == continuous[rank]["optimizer_step"]

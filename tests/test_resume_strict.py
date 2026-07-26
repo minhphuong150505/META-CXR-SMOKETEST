@@ -30,8 +30,10 @@ if str(_REPO_ROOT) not in sys.path:
 
 from model.lavis.common.optims import LinearWarmupCosineLRScheduler
 from smoke.resume import (
+    CHECKPOINT_VERSION,
     RESUME_MODES,
     ResumeReport,
+    assert_resumable_version,
     build_runtime_contract,
     capture_rng_state,
     diff_states,
@@ -287,3 +289,77 @@ def test_generator_absent_from_old_checkpoint_is_reported_not_faked():
     report.fail("dataloader_generator", "not restored")
     with pytest.raises(RuntimeError, match="dataloader_generator"):
         report.raise_if_strict()
+
+
+# --------------------------------------------------------------------------- #
+# Legacy schema rejection                                                      #
+# --------------------------------------------------------------------------- #
+# Run e123 left a v2 checkpoint behind. It is missing seven state groups, and
+# three of them cannot be reconstructed by any migration: the DataLoader
+# generator RNG (never written -> batch order after resume cannot match), the
+# 1024-sample ITC negative queue (never written -> the contrastive loss restarts
+# from empty), and the real AMP scale (the file carries a *reset* 65536 written
+# because the live scale had collapsed to 0). The loader must therefore say
+# "retrain from epoch 0" up front rather than emit a PARTIAL banner that reads
+# like something could still be salvaged.
+@pytest.mark.parametrize("version", [1, 2])
+def test_pre_v3_checkpoint_is_rejected_with_a_retrain_instruction(version):
+    checkpoint = {"epoch": 1}
+    if version > 1:
+        checkpoint["checkpoint_version"] = version
+
+    with pytest.raises(RuntimeError) as excinfo:
+        assert_resumable_version(checkpoint, "checkpoint_last.pth")
+
+    message = str(excinfo.value)
+    assert f"v{version}" in message
+    assert "Retrain from epoch 0" in message
+    assert "checkpoint_last.pth" in message
+    # Must not offer best_effort as a workaround: it is not one.
+    assert "best_effort does NOT unlock" in message
+
+
+def test_current_schema_is_accepted_and_reports_its_version():
+    checkpoint = {"checkpoint_version": CHECKPOINT_VERSION, "epoch": 1}
+    assert assert_resumable_version(checkpoint) == CHECKPOINT_VERSION
+
+
+def test_version_gate_is_independent_of_resume_mode():
+    """best_effort is for a *recoverable* partial resume, not for a schema that
+    structurally cannot reproduce the run."""
+    for mode in RESUME_MODES:
+        report = ResumeReport(mode)  # mode is irrelevant here by design
+        assert report.mode == mode
+        with pytest.raises(RuntimeError):
+            assert_resumable_version({"checkpoint_version": 2, "epoch": 0})
+
+
+# --------------------------------------------------------------------------- #
+# Provenance is not a resume blocker                                           #
+# --------------------------------------------------------------------------- #
+def test_source_commit_mismatch_is_reported_but_does_not_fail_strict():
+    """source_commit records which commit produced the weights. Nothing the
+    optimizer reads comes from it, and the load-bearing config is gated by
+    `identity` + `runtime_contract`, so gating on it too would strand every
+    checkpoint the moment a comment-only commit lands."""
+    report = ResumeReport("strict")
+    report.ok("model", "loaded")
+    report.warn("source_commit", "mismatch (checkpoint=aaa, current=bbb)")
+
+    report.raise_if_strict()  # must not raise
+    assert report.status == "FULL"
+
+    rendered = report.render()
+    assert "non_blocking_warnings" in rendered
+    assert "source_commit" in rendered
+    assert "missing_or_reset_states" not in rendered
+
+
+def test_a_warning_does_not_mask_a_real_missing_state():
+    report = ResumeReport("strict")
+    report.warn("source_commit", "mismatch")
+    report.fail("dataloader_generator", "not restored")
+
+    with pytest.raises(RuntimeError, match="dataloader_generator"):
+        report.raise_if_strict()
+    assert report.status == "PARTIAL"

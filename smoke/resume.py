@@ -45,6 +45,20 @@ import torch
 #       state, and lr_by_group. Written whenever resume_mode is honoured.
 CHECKPOINT_VERSION = 3
 
+# The oldest schema a resume can still reproduce an uninterrupted run from.
+# v1/v2 checkpoints predate the dataloader-generator RNG, the ITC negative queue
+# and the scheduler/runtime-contract snapshots, and none of those three can be
+# reconstructed after the fact:
+#   * the DataLoader generator state was never written, so the post-resume batch
+#     order cannot be made to match a continuous run;
+#   * the 1024-sample ITC queue was never written, so the contrastive loss
+#     restarts from an empty queue on a different trajectory;
+#   * a v2 scaler saved with scaler_healthy=False carries a *reset* scale, not
+#     the scale the run was actually training at.
+# There is therefore no migration that produces an exact resume -- the only
+# honest options are "retrain from epoch 0" or a knowingly PARTIAL run.
+MIN_RESUMABLE_CHECKPOINT_VERSION = 3
+
 _RNG_STREAMS = ("python", "numpy", "torch", "cuda", "dataloader_generator")
 
 # The two resume contracts.  ``strict`` refuses to continue unless every piece
@@ -348,9 +362,20 @@ class ResumeReport:
         self.mode = normalize_resume_mode(mode)
         self.fields: dict[str, str] = {}
         self.missing: list[str] = []
+        self.warnings: list[str] = []
 
     def ok(self, name: str, detail: str = "loaded") -> None:
         self.fields[name] = detail
+
+    def warn(self, name: str, detail: str) -> None:
+        """Record something the operator must see but that does NOT block.
+
+        For provenance-only discrepancies: they change nothing the optimizer
+        reads, so gating strict resume on them would strand a checkpoint over a
+        comment-only commit.
+        """
+        self.fields[name] = detail
+        self.warnings.append(f"{name}: {detail}")
 
     def fail(self, name: str, detail: str) -> None:
         self.fields[name] = detail
@@ -382,6 +407,9 @@ class ResumeReport:
         )
         lines = [f"===== {title} ====="]
         lines += [f"{k}={v}" for k, v in self.fields.items()]
+        if self.warnings:
+            lines.append("non_blocking_warnings:")
+            lines += [f"- {item}" for item in self.warnings]
         if self.missing:
             lines.append("missing_or_reset_states:")
             lines += [f"- {item}" for item in self.missing]
@@ -389,6 +417,37 @@ class ResumeReport:
         lines.append(f"resume_status={self.status}")
         lines.append("=" * (len(title) + 12))
         return "\n".join(lines)
+
+
+def checkpoint_version(checkpoint: dict) -> int:
+    """The on-disk schema version; 1 for checkpoints written before the field."""
+    return int(checkpoint.get("checkpoint_version", 1) or 1)
+
+
+def assert_resumable_version(checkpoint: dict, path: str = "") -> int:
+    """Refuse to resume a checkpoint whose schema cannot reproduce the run.
+
+    Called before any state is loaded, so the operator gets one actionable
+    sentence instead of a PARTIAL banner listing seven separately-missing
+    states that no migration can fill in.  See
+    :data:`MIN_RESUMABLE_CHECKPOINT_VERSION` for why there is no v2 -> v3
+    upgrade path.
+    """
+    version = checkpoint_version(checkpoint)
+    if version >= MIN_RESUMABLE_CHECKPOINT_VERSION:
+        return version
+    where = f" ({path})" if path else ""
+    raise RuntimeError(
+        f"Checkpoint schema v{version}{where} is too old to resume: v"
+        f"{MIN_RESUMABLE_CHECKPOINT_VERSION} added the DataLoader-generator RNG, "
+        "the ITC negative queue, and the scheduler/runtime-contract snapshots. "
+        "None of the three can be reconstructed from a v"
+        f"{version} file, so no migration yields an exact resume.\n"
+        "Retrain from epoch 0: move the checkpoint aside and start a fresh run. "
+        "resume_mode=best_effort does NOT unlock this -- a partial resume from "
+        "this schema is a different training trajectory wearing the old run's "
+        "name, not a continuation of it."
+    )
 
 
 def resolve_next_epoch(checkpoint: dict) -> int:

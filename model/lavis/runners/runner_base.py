@@ -41,6 +41,7 @@ from smoke.identity import assert_checkpoint_identity, build_checkpoint_identity
 from smoke.resume import (
     CHECKPOINT_VERSION,
     ResumeReport,
+    assert_resumable_version,
     build_runtime_contract,
     capture_rng_state,
     diff_states,
@@ -1358,7 +1359,14 @@ class RunnerBase:
         # `report.missing` becomes a RuntimeError before training starts.
         report = ResumeReport(self.resume_mode)
         report.ok("checkpoint", str(url_or_filename))
-        report.ok("checkpoint_version", str(checkpoint.get("checkpoint_version", "legacy_v1")))
+        # Before touching any state: a pre-v3 file is missing training state that
+        # cannot be reconstructed (dataloader RNG, ITC queue, the real AMP
+        # scale), so it gets one actionable error instead of a PARTIAL banner
+        # implying some migration could still rescue it.
+        report.ok(
+            "checkpoint_version",
+            f"v{assert_resumable_version(checkpoint, str(url_or_filename))}",
+        )
 
         state_dict = checkpoint["model"]
         expected_identity = self._checkpoint_identity()
@@ -1368,18 +1376,21 @@ class RunnerBase:
         report.ok("dataset_manifest", "matched")
         report.ok("config_fingerprint", "matched")
 
-        # source_commit is provenance, not identity (a plumbing-only commit must
-        # not strand a checkpoint). Strict resume still reports a mismatch,
-        # because "the code changed under the optimizer" is exactly the kind of
-        # thing that silently breaks equivalence with a continuous run.
+        # source_commit is provenance, not identity: nothing the optimizer reads
+        # comes from it, and the load-bearing config IS gated, by `identity`
+        # (dataset + scientific config) and `runtime_contract` (world size,
+        # batching, optimizer/scheduler hyperparameters) below. Failing strict
+        # resume on it would strand every checkpoint the moment a comment-only
+        # commit lands, so it is reported as a non-blocking warning instead.
         saved_commit = checkpoint.get("source_commit")
         current_commit = self.config.run_cfg.get("source_commit")
         if saved_commit == current_commit:
             report.ok("source_commit", "matched")
         else:
-            report.fail(
+            report.warn(
                 "source_commit",
-                f"mismatch (checkpoint={saved_commit}, current={current_commit})",
+                f"mismatch (checkpoint={saved_commit}, current={current_commit}) "
+                "- provenance only, not gated",
             )
 
         contract_diff = diff_states(
