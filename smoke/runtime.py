@@ -176,9 +176,12 @@ def load_kaggle_secrets(secret_names: tuple[str, ...], secret_dir: str | Path) -
             raise RuntimeError(f"Required Kaggle secret {name!r} is empty")
         values[name] = value
 
-    os.environ["WANDB_API_KEY"] = values["WANDB_API_KEY"]
-    os.environ["HF_TOKEN"] = values["HF_TOKEN"]
-    os.environ["KAGGLE_API_TOKEN"] = values["KAGGLE_API_TOKEN"]
+    for name in ("WANDB_API_KEY", "HF_TOKEN", "KAGGLE_API_TOKEN"):
+        if name in values:
+            os.environ[name] = values[name]
+
+    if "GCS_SERVICE_ACCOUNT" not in values:
+        return
     try:
         service_account = json.loads(values["GCS_SERVICE_ACCOUNT"])
     except json.JSONDecodeError as exc:

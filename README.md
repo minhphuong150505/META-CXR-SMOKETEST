@@ -11,11 +11,12 @@ contains code only.
 Attach exactly one private Kaggle dataset containing `dataset_manifest.json`
 and the documented `files/`, `processed/`, and `manifests/` layout. Set the
 parameter cell in `notebooks/01_stage1_smoke_2xt4.ipynb`, run one session epoch,
-then publish the verified output to the private checkpoint dataset handle.
-Resume by attaching that checkpoint dataset and incrementing `SESSION_INDEX`.
-Configure the private Kaggle secrets `GCS_SERVICE_ACCOUNT`, `WANDB_API_KEY`,
-`HF_TOKEN`, and `KAGGLE_API_TOKEN`; the last one authorizes private checkpoint
-dataset updates.
+then publish the verified checkpoints to the private GCS bucket configured in
+the notebook. Each later session downloads `checkpoint_last.pth` from that
+bucket and increments `SESSION_INDEX`.
+Configure the private Kaggle secrets `GCS_SERVICE_ACCOUNT` and `WANDB_API_KEY`.
+The service account must be able to read and update the private GCS checkpoint
+bucket used by the notebook.
 
 `notebooks/02_encoder_sensitivity_2xt4.ipynb` evaluates seven post-training
 encoder masks from the single E123 checkpoint. These are inference-sensitivity
