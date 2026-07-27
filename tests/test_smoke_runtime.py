@@ -1,5 +1,4 @@
 import json
-from pathlib import Path
 
 import pytest
 import yaml
@@ -8,9 +7,15 @@ from smoke.runtime import (
     assert_session_eta,
     discover_dataset,
     load_dataset_manifest,
+    load_kaggle_secrets,
     sha256_file,
     write_runtime_env_config,
 )
+
+
+def test_kaggle_secrets_refuse_published_working_directory():
+    with pytest.raises(ValueError, match="must not be written under /kaggle/working"):
+        load_kaggle_secrets(("GCS_SERVICE_ACCOUNT",), "/kaggle/working/secrets")
 
 
 def test_dataset_discovery_requires_exact_slug_and_manifest(tmp_path):

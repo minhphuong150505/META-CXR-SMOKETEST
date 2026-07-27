@@ -72,6 +72,15 @@ def test_clean_notebook_is_accepted(tmp_path):
     assert main(["--path", str(clean)]) == EXIT_OK
 
 
+@pytest.mark.parametrize(
+    "name", ["01_stage1_smoke_2xt4.ipynb", "02_encoder_sensitivity_2xt4.ipynb"]
+)
+def test_kaggle_notebooks_keep_credentials_out_of_published_output(name):
+    source = (REPO_ROOT / "notebooks" / name).read_text(encoding="utf-8")
+    assert "/kaggle/working/.meta-cxr-secrets" not in source
+    assert "/tmp/.meta-cxr-secrets" in source
+
+
 def test_executed_output_is_detected(tmp_path):
     assert "executed_output_present" in kinds(notebook(tmp_path, "executed_output"))
 
