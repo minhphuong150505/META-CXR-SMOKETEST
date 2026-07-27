@@ -28,11 +28,16 @@ import datetime
 import os
 import subprocess
 import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+
+from smoke.sampling import negative_sampling_weights
 
 WORLD_SIZE = 2
 B, P, D = 4, 5, 32  # batch per rank, tokens, dim (tiny; only structure matters)
@@ -92,10 +97,9 @@ class ItmProbe(nn.Module):
         positive_indices = rank * B + torch.arange(B)
 
         with torch.no_grad():
-            w = F.softmax(sim, dim=1).clone()
-            w[:, ~valid_all] = 0
-            w[torch.arange(B), positive_indices] = 0
-            w = w / w.sum(dim=1, keepdim=True).clamp_min(1e-12)
+            candidate_mask = valid_all.unsqueeze(0).expand(B, -1).clone()
+            candidate_mask[torch.arange(B), positive_indices] = False
+            w = negative_sampling_weights(sim, candidate_mask)
 
         if local_valid:
             local_indices = valid_mask.nonzero(as_tuple=True)[0]

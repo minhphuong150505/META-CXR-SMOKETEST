@@ -19,26 +19,24 @@ from model.lavis.models.blip2_models.blip2 import (
     disabled_train,
 )
 from model.lavis.models.blip_models.blip_outputs import BlipOutput, BlipOutputFeatures
-
+from mhcac.loss import (
+    ClassificationLoss,
+    MultiPositiveContrastiveLoss,
+    graph_connected_zero,
+    soft_target_kl_loss,
+    view_consistency_loss,
+)
 from mhcac.mhcac_12 import AbnormalityClassificationModel
-
-
+from mhcac.view_fusion import ViewFusionModule
+from smoke.sampling import negative_sampling_weights
 from vision_encoders.pubmedclip.pubmed_clip import Pubmedclip
-from vision_encoders.swin.swin_encoder import SwinEncoder
 from vision_encoders.shared_visual_tokens import SharedVisualTokenProjector
+from vision_encoders.swin.swin_encoder import SwinEncoder
+
 # from vision_encoders.medclip.medclip import Medclip
 
 # Common dimension every encoder is projected to before the merge.
 VISUAL_DIM = 1408
-
-from mhcac.loss import (
-    ClassificationLoss,
-    graph_connected_zero,
-    MultiPositiveContrastiveLoss,
-    soft_target_kl_loss,
-    view_consistency_loss,
-)
-from mhcac.view_fusion import ViewFusionModule
 
 chexpert_cols = ["No Finding", "Enlarged Cardiomediastinum",
                               "Cardiomegaly", "Lung Opacity",
@@ -718,20 +716,19 @@ class Blip2Qformer(Blip2Base):
         )
 
         with torch.no_grad():
-            weights_t2i = F.softmax(sim_t2i, dim=1)
-            weights_i2t = F.softmax(sim_i2t, dim=1)
-            weights_t2i[:, ~valid_all] = 0
-            weights_i2t[:, ~valid_all] = 0
             rows = torch.arange(batch_size, device=image_embeds.device)
-            weights_t2i[rows, positive_indices] = 0
-            weights_i2t[rows, positive_indices] = 0
-            weights_t2i = weights_t2i / weights_t2i.sum(dim=1, keepdim=True).clamp_min(1e-12)
-            weights_i2t = weights_i2t / weights_i2t.sum(dim=1, keepdim=True).clamp_min(1e-12)
+            candidate_mask = valid_all.unsqueeze(0).expand(batch_size, -1).clone()
+            candidate_mask[rows, positive_indices] = False
+            # Mask before softmax. Masking the positive *after* softmax lets an
+            # overwhelmingly large self-logit underflow every negative to zero,
+            # which makes torch.multinomial raise a CUDA device-side assert.
+            weights_t2i = negative_sampling_weights(sim_t2i, candidate_mask)
+            weights_i2t = negative_sampling_weights(sim_i2t, candidate_mask)
 
         # Fall back to a single dummy row when this rank has no valid report so the
         # ITM forward still runs (params used); its loss is masked to zero below.
-        # valid_all.sum() >= 2 keeps each row's negative-sampling distribution
-        # non-degenerate, so multinomial is safe even for the dummy row.
+        # valid_all.sum() >= 2 guarantees at least one eligible candidate; the
+        # helper above also handles underflow and non-finite similarity scores.
         if local_valid:
             local_indices = valid_mask.nonzero(as_tuple=True)[0]
         else:
