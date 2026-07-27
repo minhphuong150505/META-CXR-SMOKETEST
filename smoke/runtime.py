@@ -12,7 +12,6 @@ from pathlib import Path
 
 import yaml
 
-
 FINGERPRINT_PACKAGES = (
     "torch",
     "torchvision",
@@ -159,6 +158,14 @@ def compatibility_matrix(before: dict, after: dict) -> dict:
 
 def load_kaggle_secrets(secret_names: tuple[str, ...], secret_dir: str | Path) -> None:
     """Load named Kaggle secrets into the process without printing values."""
+    secret_dir = Path(secret_dir).resolve()
+    kaggle_output_root = Path("/kaggle/working")
+    if secret_dir == kaggle_output_root or kaggle_output_root in secret_dir.parents:
+        raise ValueError(
+            "Kaggle credential material must not be written under /kaggle/working; "
+            "that directory is published as notebook output"
+        )
+
     from kaggle_secrets import UserSecretsClient
 
     client = UserSecretsClient()
@@ -180,7 +187,6 @@ def load_kaggle_secrets(secret_names: tuple[str, ...], secret_dir: str | Path) -
     if required - set(service_account):
         raise RuntimeError("GCS_SERVICE_ACCOUNT is missing required fields")
 
-    secret_dir = Path(secret_dir)
     secret_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     key_path = secret_dir / "gcs-service-account.json"
     key_path.write_text(json.dumps(service_account), encoding="utf-8")
