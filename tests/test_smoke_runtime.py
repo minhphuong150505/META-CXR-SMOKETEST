@@ -1,4 +1,8 @@
 import json
+import os
+import sys
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -16,6 +20,41 @@ from smoke.runtime import (
 def test_kaggle_secrets_refuse_published_working_directory():
     with pytest.raises(ValueError, match="must not be written under /kaggle/working"):
         load_kaggle_secrets(("GCS_SERVICE_ACCOUNT",), "/kaggle/working/secrets")
+
+
+def test_kaggle_secret_loader_only_requires_requested_names(tmp_path, monkeypatch):
+    values = {
+        "GCS_SERVICE_ACCOUNT": json.dumps(
+            {
+                "type": "service_account",
+                "project_id": "test-project",
+                "private_key": "synthetic-test-key",
+                "client_email": "test@example.invalid",
+            }
+        ),
+        "WANDB_API_KEY": "synthetic-wandb-key",
+    }
+
+    class FakeSecretsClient:
+        def get_secret(self, name):
+            return values.get(name)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "kaggle_secrets",
+        SimpleNamespace(UserSecretsClient=FakeSecretsClient),
+    )
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    monkeypatch.delenv("KAGGLE_API_TOKEN", raising=False)
+
+    load_kaggle_secrets(
+        ("GCS_SERVICE_ACCOUNT", "WANDB_API_KEY"), tmp_path / "private"
+    )
+
+    assert "HF_TOKEN" not in os.environ
+    assert "KAGGLE_API_TOKEN" not in os.environ
+    assert os.environ["WANDB_API_KEY"] == "synthetic-wandb-key"
+    assert Path(os.environ["GOOGLE_APPLICATION_CREDENTIALS"]).is_file()
 
 
 def test_dataset_discovery_requires_exact_slug_and_manifest(tmp_path):

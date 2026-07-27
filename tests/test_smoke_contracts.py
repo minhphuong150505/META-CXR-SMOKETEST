@@ -75,5 +75,5 @@ def test_notebooks_are_clean_and_parameterized():
         assert "REPO_COMMIT = " in source
         assert "GCS_SERVICE_ACCOUNT" in source
         assert "WANDB_API_KEY" in source
-        assert "HF_TOKEN" in source
-        assert "KAGGLE_API_TOKEN" in source
+        assert "HF_TOKEN" not in source
+        assert "KAGGLE_API_TOKEN" not in source
