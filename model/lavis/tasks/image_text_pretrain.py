@@ -79,7 +79,19 @@ class ImageTextPretrainTask(BaseTask):
         collected_labels = []
         collected_keys = []
 
-        for batch in data_loader:
+        for batch_index, batch in enumerate(data_loader):
+            # Kaggle's batch runner can terminate a kernel without a Python
+            # traceback. A rank-0 heartbeat distinguishes a live full-objective
+            # validation pass from a silent DDP stall and records its progress
+            # in the persisted console log.
+            if batch_index % 50 == 0 and (
+                not is_dist_avail_and_initialized() or dist.get_rank() == 0
+            ):
+                logger.warning(
+                    "[validation] batch=%d/%d",
+                    batch_index,
+                    len(data_loader),
+                )
             if cuda_enabled:
                 batch = move_to_cuda(batch)
             if classification_only:

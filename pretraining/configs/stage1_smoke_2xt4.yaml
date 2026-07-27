@@ -84,7 +84,10 @@ run:
   scheduler_max_epoch: 10
   save_freq: 0
   batch_size_train: 4
-  batch_size_eval: 2
+  # Validation runs under torch.no_grad(), so it can safely use twice the
+  # training micro-batch. This halves full-objective validation time without
+  # changing the optimizer trajectory, LR schedule, or checkpoint identity.
+  batch_size_eval: 4
   num_workers: 4
   warmup_steps: 1
   accum_grad_iters: 16
