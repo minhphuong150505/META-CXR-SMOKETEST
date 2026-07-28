@@ -19,11 +19,13 @@ def test_training_config_is_exact_e123_multiview_policy():
     assert config["model"]["multi_view"] is True
     assert config["run"]["world_size"] == 2
     assert config["run"]["distributed"] is True
-    # Checkpoint selection is on the validation classification loss (min), not
-    # on F1: the loss moves every epoch, while F1 can sit on a plateau for a
-    # whole epoch and pick an arbitrary checkpoint.
-    assert config["run"]["selection_metric"] == "loss"
-    assert config["run"]["selection_mode"] == "min"
+    # Checkpoint selection is on positive-class macro F1 (max), matching the
+    # metric nb01 records in config_fingerprint. Total validation loss was the
+    # previous selector and it is dominated by ITC, which rose across epochs
+    # 0-2 of the e123 run while F1 doubled -- so `loss` pinned
+    # checkpoint_best to epoch 0, the worst classifier of the three.
+    assert config["run"]["selection_metric"] == "f1_positive_macro_defined_only"
+    assert config["run"]["selection_mode"] == "max"
     assert config["run"]["uncertain_policy"] == "ignore_uncertain"
 
 
