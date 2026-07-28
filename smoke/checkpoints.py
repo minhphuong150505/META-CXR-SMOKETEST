@@ -158,3 +158,25 @@ def download_last_checkpoint(bucket_name: str, dest: str | Path):
     local = dest / "checkpoint_last.pth"
     blob.download_to_filename(str(local))
     return local
+
+
+def download_best_checkpoint(bucket_name: str, dest: str | Path) -> Path:
+    """Download checkpoint_best.pth from the bucket root for final evaluation.
+
+    Unlike ``download_last_checkpoint``, a best checkpoint is mandatory for
+    held-out sensitivity evaluation, so a missing object is an explicit error.
+    """
+    dest = Path(dest)
+    bucket = _gcs_client().bucket(bucket_name)
+    blob = bucket.blob("checkpoint_best.pth")
+    if not blob.exists():
+        raise FileNotFoundError(
+            f"gs://{bucket_name}/checkpoint_best.pth is missing; finish at least "
+            "one validation epoch and upload the Stage-1 checkpoint first"
+        )
+    dest.mkdir(parents=True, exist_ok=True)
+    local = dest / "checkpoint_best.pth"
+    blob.download_to_filename(str(local))
+    if not local.is_file() or local.stat().st_size == 0:
+        raise RuntimeError("Downloaded checkpoint_best.pth is empty")
+    return local
