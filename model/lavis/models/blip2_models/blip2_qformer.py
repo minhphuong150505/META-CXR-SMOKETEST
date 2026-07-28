@@ -642,7 +642,17 @@ class Blip2Qformer(Blip2Base):
         else:
             candidate_valid = valid_all
 
-        temperature = self.temp.clamp(min=1e-3, max=0.5)
+        # Floor is 0.01, CLIP's maximum logit scale of 100. The previous 1e-3
+        # allowed a logit scale of 1000: ITC always pushes temp down to sharpen
+        # the softmax, and by optimizer step ~1971 of the e123 run temp had
+        # reached 5.19e-4, i.e. through the floor. Any batch holding a false
+        # negative (MIMIC-CXR repeats reports, and the 1024-entry queue is very
+        # likely to carry a duplicate of the positive) then produced an ITC loss
+        # in the hundreds -- normalized features bound it at 2/T + ln(N), which
+        # is ~36 at T=0.07 but ~2007 at T=1e-3. Bursts of 90-170 were observed.
+        # clamp has zero gradient outside the range, so temp freezes on contact
+        # with the floor rather than drifting further.
+        temperature = self.temp.clamp(min=0.01, max=0.5)
         sim_i2t = torch.einsum(
             "bqd,nd->bnq", image_features, text_features_all
         ).amax(dim=-1) / temperature
