@@ -84,10 +84,13 @@ run:
   scheduler_max_epoch: 10
   save_freq: 0
   batch_size_train: 4
-  # Validation runs under torch.no_grad(), so it can safely use twice the
-  # training micro-batch. This halves full-objective validation time without
-  # changing the optimizer trajectory, LR schedule, or checkpoint identity.
-  batch_size_eval: 4
+  # Full-objective validation still runs three encoders and the Q-Former
+  # (ITC/ITM/LM/classification). Although it uses no gradients, a batch of 4
+  # can exhaust a 16GB T4 on the first evaluation pass; Kaggle may then kill
+  # the whole kernel instead of returning a CUDA OOM exception. Keep this
+  # aligned with the fp32 train micro-batch. It does not affect checkpoint
+  # identity or the optimizer trajectory.
+  batch_size_eval: 2
   num_workers: 4
   warmup_steps: 1
   accum_grad_iters: 16
