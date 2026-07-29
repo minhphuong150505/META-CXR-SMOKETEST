@@ -65,6 +65,7 @@ def test_notebooks_are_clean_and_parameterized():
     assert [path.name for path in notebooks] == [
         "01_stage1_smoke_2xt4.ipynb",
         "02_encoder_sensitivity_2xt4.ipynb",
+        "03_report_generation_metrics_2xt4.ipynb",
     ]
     for path in notebooks:
         notebook = json.loads(path.read_text(encoding="utf-8"))
