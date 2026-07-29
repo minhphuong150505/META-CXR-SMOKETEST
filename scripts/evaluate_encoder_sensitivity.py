@@ -23,6 +23,10 @@ from model.lavis.data.ReportDataset import MIMIC_CXR_Dataset
 from model.lavis.models.blip2_models.blip2_qformer import Blip2Qformer, chexpert_cols
 from model.lavis.tasks.image_text_pretrain import ImageTextPretrainTask
 from training.evaluation.classification_metrics import evaluate_classification
+from training.evaluation.paper_table5 import (
+    PAPER_TABLE5_PATHOLOGIES,
+    paper_table5_weighted_f1,
+)
 from training.evaluation.schemas import ClassificationPredictions
 
 
@@ -36,12 +40,16 @@ MASKS = {
     "E123": ("biovil", "pubmedclip", "swin"),
 }
 
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cfg-path", required=True)
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--output", required=True)
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="replace an existing aggregate-only sensitivity result",
+    )
     parser.add_argument("--source-commit", required=True)
     parser.add_argument("--dataset-manifest-sha256", required=True)
     parser.add_argument("--config-fingerprint", required=True)
@@ -89,9 +97,12 @@ def main() -> None:
     args = parse_args()
     output = Path(args.output)
     if output.exists():
-        raise FileExistsError(
-            f"Refusing to rerun held-out sensitivity evaluation over existing {output}"
-        )
+        if not args.overwrite:
+            raise FileExistsError(
+                f"Refusing to rerun held-out sensitivity evaluation over existing {output}"
+            )
+        output.unlink()
+        output.with_suffix(".md").unlink(missing_ok=True)
     if torch.cuda.device_count() < 1:
         raise RuntimeError("Sensitivity evaluation requires one CUDA GPU")
 
@@ -176,9 +187,15 @@ def main() -> None:
             include_meta_labels=False,
             binary_predictions=binary,
         ).to_dict()
+        reports[name]["paper_table5"] = paper_table5_weighted_f1(
+            labels, logits, tuple(chexpert_cols)
+        )
 
     metric = "positive_macro_f1"
     score = {name: reports[name]["aggregates"][metric] for name in MASKS}
+    paper_score = {
+        name: reports[name]["paper_table5"]["mean_weighted_f1"] for name in MASKS
+    }
     deltas = {
         "E123_minus_pairs": {pair: score["E123"] - score[pair] for pair in ("E12", "E13", "E23")},
         "pairs_minus_singletons": {
@@ -200,6 +217,10 @@ def main() -> None:
         "eval_source_commit": args.source_commit,
         "checkpoint_epoch": checkpoint.get("epoch"),
         "masks": {name: list(value) for name, value in MASKS.items()},
+        "paper_table5_protocol": {
+            "metric": "mean_per_pathology_weighted_f1_three_class_argmax",
+            "pathologies": list(PAPER_TABLE5_PATHOLOGIES),
+        },
         "reports": reports,
         "deltas": deltas,
         "test_studies": len(dataset),
@@ -217,11 +238,14 @@ def main() -> None:
 
     table = [
         "# Encoder inference sensitivity", "",
-        "> One E123 training run; masked results are not independently trained ablations.", "",
-        "| ID | Encoders kept | Positive macro F1 |", "|---|---|---:|",
+        "> One E123 training run; selective encoder activation at inference, matching the paper's Table-5 ablation protocol.", "",
+        "| ID | Encoders kept | Paper Table-5 weighted F1 | Positive macro F1 |",
+        "|---|---|---:|---:|",
     ]
     for name, keep in MASKS.items():
-        table.append(f"| {name} | {' + '.join(keep)} | {score[name]:.6f} |")
+        table.append(
+            f"| {name} | {' + '.join(keep)} | {paper_score[name]:.6f} | {score[name]:.6f} |"
+        )
     output.with_suffix(".md").write_text("\n".join(table) + "\n", encoding="utf-8")
 
 
