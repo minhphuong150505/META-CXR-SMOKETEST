@@ -177,7 +177,7 @@ def test_predictions_are_not_saved_unless_requested(tmp_path):
 
 
 class FakeStudentModel(torch.nn.Module):
-    """The `classification_only_eval: true` path: forward_image, no loss."""
+    """The image-only path; evaluation recomputes its classification loss."""
 
     def __init__(self, logits, loss_value=0.25):
         super().__init__()
