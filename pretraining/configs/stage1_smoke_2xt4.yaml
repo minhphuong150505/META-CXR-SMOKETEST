@@ -85,12 +85,13 @@ run:
   save_freq: 0
   batch_size_train: 4
   # Full-objective validation still runs three encoders and the Q-Former
-  # (ITC/ITM/LM/classification). Although it uses no gradients, a batch of 4
-  # can exhaust a 16GB T4 on the first evaluation pass; Kaggle may then kill
-  # the whole kernel instead of returning a CUDA OOM exception. Keep this
-  # aligned with the fp32 train micro-batch. It does not affect checkpoint
-  # identity or the optimizer trajectory.
-  batch_size_eval: 2
+  # (ITC/ITM/LM/classification). In fp32, even two multi-view studies can
+  # exceed a 16GB T4 during the first eval forward; Kaggle may kill the whole
+  # kernel rather than returning a catchable CUDA OOM. Evaluation uses no
+  # gradients, so use one study at a time for a reliable VRAM ceiling. This
+  # does not affect checkpoint identity, optimizer state, or training
+  # trajectory, and is deliberately excluded from the strict resume contract.
+  batch_size_eval: 1
   num_workers: 4
   warmup_steps: 1
   accum_grad_iters: 16
