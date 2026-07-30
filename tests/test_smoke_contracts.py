@@ -27,6 +27,11 @@ def test_training_config_is_exact_e123_multiview_policy():
     assert config["run"]["selection_metric"] == "f1_positive_macro_defined_only"
     assert config["run"]["selection_mode"] == "max"
     assert config["run"]["uncertain_policy"] == "ignore_uncertain"
+    # Validation selects on the image-only classifier.  Running the full text
+    # objectives here adds per-batch NCCL collectives without affecting the
+    # selected metric and turns a slow DataLoader rank into a DDP deadlock.
+    assert config["run"]["classification_only_eval"] is True
+    assert config["run"]["dataloader_timeout"] == 120
 
 
 def test_sensitivity_matrix_has_seven_predeclared_masks():

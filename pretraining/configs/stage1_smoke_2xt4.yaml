@@ -93,6 +93,12 @@ run:
   # trajectory, and is deliberately excluded from the strict resume contract.
   batch_size_eval: 1
   num_workers: 4
+  # Fail fast on a wedged Kaggle image read/worker.  The previous implicit
+  # 600-second timeout allowed one validation rank to leave its peer blocked in
+  # a collective long enough for torchrun's rendezvous heartbeat to expire.
+  # This is deliberately not part of the strict resume contract: it changes
+  # failure latency only, never sample order or optimizer state.
+  dataloader_timeout: 120
   warmup_steps: 1
   accum_grad_iters: 16
   max_grad_norm: 1.0
@@ -144,13 +150,17 @@ run:
   # epochs 0-2 while f1_positive_macro_defined_only went 0.143 -> 0.295, so
   # `loss` pinned checkpoint_best to epoch 0 -- the worst classifier of the
   # three. `loss` stays in the stats if a loss-based selector is wanted again.
-  # Still requires the full eval forward: classification_only_eval calls
-  # forward_image, which returns logits only and no loss at all. The full
-  # forward runs collectives (ITC all_gather, ITM/teacher all_reduce), which is
-  # why DistributedEvalSampler pads every rank to the same batch count.
+  # Selection only needs the image-only student logits.  Re-running the full
+  # ITC/ITM/LM/teacher objective here made every validation batch execute NCCL
+  # collectives; one slow Kaggle DataLoader rank then blocked its peer and could
+  # expire torchrun's rendezvous heartbeat.  The classification-only path uses
+  # the exact inference/student classifier and recomputes loss_cls with the same
+  # labels/mask as training.  It therefore preserves the selected F1 metric,
+  # while removing text-objective collectives and substantially shortening the
+  # vulnerable validation phase.  Training itself remains full-objective.
   selection_metric: f1_positive_macro_defined_only
   selection_mode: max
-  classification_only_eval: false
+  classification_only_eval: true
   save_predictions: false
   finalize_test: false
   evaluate: false
