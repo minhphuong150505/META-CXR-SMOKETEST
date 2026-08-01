@@ -19,7 +19,8 @@ The service account must be able to read and update the private GCS checkpoint
 bucket used by the notebook.
 
 `notebooks/02_encoder_sensitivity_2xt4.ipynb` evaluates seven post-training
-encoder masks from the single E123 checkpoint. These are inference-sensitivity
+encoder subsets from the single E123 checkpoint. For this evaluation only,
+inactive token spans are removed before MHCAC. These are inference-sensitivity
 measurements, not independently trained ablations and not causal contributions.
 
 Private run artifacts use:

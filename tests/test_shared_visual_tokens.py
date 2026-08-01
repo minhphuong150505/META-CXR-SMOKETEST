@@ -84,6 +84,27 @@ class TestBothBranchesSeeTheSameTensor(unittest.TestCase):
 
 
 class TestMasking(unittest.TestCase):
+    def test_select_removes_disabled_streams_and_rebuilds_spans(self):
+        projector = SharedVisualTokenProjector(STREAM_DIMS, VISUAL_DIM)
+        shared = projector(make_streams())
+        selected = shared.select("swin", "biovil")
+
+        self.assertEqual(tuple(selected.spans), ("biovil", "swin"))
+        self.assertEqual(selected.spans["biovil"], slice(0, 196))
+        self.assertEqual(selected.spans["swin"], slice(196, 245))
+        self.assertEqual(selected.tokens.shape[1], 196 + 49)
+        torch.testing.assert_close(selected.stream("biovil"), shared.stream("biovil"))
+        torch.testing.assert_close(selected.stream("swin"), shared.stream("swin"))
+        validate_shared_visual_tokens(selected, VISUAL_DIM)
+
+    def test_select_rejects_empty_or_unknown_selection(self):
+        projector = SharedVisualTokenProjector(STREAM_DIMS, VISUAL_DIM)
+        shared = projector(make_streams())
+        with self.assertRaises(ValueError):
+            shared.select()
+        with self.assertRaises(KeyError):
+            shared.select("raddino")
+
     def test_masking_one_encoder_leaves_the_others_bit_identical(self):
         projector = SharedVisualTokenProjector(STREAM_DIMS, VISUAL_DIM)
         shared = projector(make_streams())

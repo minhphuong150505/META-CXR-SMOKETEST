@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Evaluate seven predeclared inference masks from one trained E123 checkpoint.
 
-All three frozen encoders run once per held-out batch. Only shared token spans
-are zeroed downstream for each mask. Results are sensitivity measurements, not
-independently trained ablations or causal contributions.
+All three frozen encoders run once per held-out batch. Inactive shared-token
+spans are removed before MHCAC for each subset. Results are sensitivity
+measurements, not independently trained ablations or causal contributions.
 """
 
 from __future__ import annotations
@@ -91,6 +91,24 @@ def json_safe(value):
     if isinstance(value, list):
         return [json_safe(item) for item in value]
     return value
+
+
+def sensitivity_deltas(scores: dict[str, float]) -> dict:
+    """Return the declared pair/singleton comparisons for one metric."""
+    return {
+        "E123_minus_pairs": {
+            pair: scores["E123"] - scores[pair]
+            for pair in ("E12", "E13", "E23")
+        },
+        "pairs_minus_singletons": {
+            "E12-E1": scores["E12"] - scores["E1"],
+            "E12-E2": scores["E12"] - scores["E2"],
+            "E13-E1": scores["E13"] - scores["E1"],
+            "E13-E3": scores["E13"] - scores["E3"],
+            "E23-E2": scores["E23"] - scores["E2"],
+            "E23-E3": scores["E23"] - scores["E3"],
+        },
+    }
 
 
 def main() -> None:
@@ -197,21 +215,14 @@ def main() -> None:
         name: reports[name]["paper_table5"]["mean_weighted_f1"] for name in MASKS
     }
     deltas = {
-        "E123_minus_pairs": {pair: score["E123"] - score[pair] for pair in ("E12", "E13", "E23")},
-        "pairs_minus_singletons": {
-            "E12-E1": score["E12"] - score["E1"],
-            "E12-E2": score["E12"] - score["E2"],
-            "E13-E1": score["E13"] - score["E1"],
-            "E13-E3": score["E13"] - score["E3"],
-            "E23-E2": score["E23"] - score["E2"],
-            "E23-E3": score["E23"] - score["E3"],
-        },
+        "paper_table5_weighted_f1": sensitivity_deltas(paper_score),
+        "positive_macro_f1": sensitivity_deltas(score),
     }
     payload = {
         "status": "pass",
         "method": "single_E123_checkpoint_post_training_inference_sensitivity",
         "warning": "Not independent ablation and not causal contribution.",
-        "uncertain_policy": "ignore_uncertain",
+        "standard_report_uncertain_policy": "ignore_uncertain",
         "checkpoint_identity": expected_identity,
         "checkpoint_source_commit": checkpoint_source_commit,
         "eval_source_commit": args.source_commit,
@@ -220,6 +231,8 @@ def main() -> None:
         "paper_table5_protocol": {
             "metric": "mean_per_pathology_weighted_f1_three_class_argmax",
             "pathologies": list(PAPER_TABLE5_PATHOLOGIES),
+            "classes": ["negative", "positive", "uncertain"],
+            "encoder_selection": "remove_inactive_token_spans_before_mhcac",
         },
         "reports": reports,
         "deltas": deltas,

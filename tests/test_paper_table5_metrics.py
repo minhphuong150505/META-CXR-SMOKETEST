@@ -48,3 +48,17 @@ def test_paper_table5_metric_is_three_class_weighted_f1_over_five_pathologies():
 
     assert result["per_pathology"]["Atelectasis"]["weighted_f1"] == pytest.approx(1 / 6)
     assert result["mean_weighted_f1"] == pytest.approx((4 + 1 / 6) / 5)
+
+
+def test_paper_table5_metric_rejects_bad_shapes_and_nonfinite_logits():
+    labels = np.zeros((2, len(PATHOLOGY_NAMES)), dtype=np.int64)
+    logits = np.zeros((2, len(PATHOLOGY_NAMES), 3), dtype=np.float64)
+
+    with pytest.raises(ValueError, match="shape mismatch"):
+        paper_table5_weighted_f1(labels[:1], logits, PATHOLOGY_NAMES)
+    with pytest.raises(ValueError, match="negative/positive/uncertain"):
+        paper_table5_weighted_f1(labels, logits[..., :2], PATHOLOGY_NAMES)
+
+    logits[0, PATHOLOGY_NAMES.index("Edema"), 1] = np.nan
+    with pytest.raises(ValueError, match="Non-finite.*Edema"):
+        paper_table5_weighted_f1(labels, logits, PATHOLOGY_NAMES)

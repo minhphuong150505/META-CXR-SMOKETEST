@@ -62,6 +62,35 @@ class SharedVisualTokens:
         mask[self.spans[name]] = True
         return mask
 
+    def select(self, *names: str) -> SharedVisualTokens:
+        """Return only the requested encoder streams, with contiguous spans.
+
+        Unlike :meth:`without`, this removes disabled tokens from the sequence.
+        It is intended for paper-style inference ablations, where an inactive
+        encoder must not remain visible to downstream projection biases,
+        positional embeddings, or attention softmax normalization.
+        """
+        requested = {str(name) for name in names}
+        if not requested:
+            raise ValueError("select must retain at least one encoder stream")
+        unknown = requested - set(self.spans)
+        if unknown:
+            raise KeyError(
+                f"unknown stream(s) {sorted(unknown)}; have {sorted(self.spans)}"
+            )
+
+        selected = []
+        spans = {}
+        cursor = 0
+        for name, span in sorted(self.spans.items(), key=lambda item: item[1].start):
+            if name not in requested:
+                continue
+            stream = self.tokens[:, span, :]
+            selected.append(stream)
+            spans[name] = slice(cursor, cursor + stream.shape[1])
+            cursor += stream.shape[1]
+        return SharedVisualTokens(tokens=torch.cat(selected, dim=1), spans=spans)
+
     def without(self, *names: str) -> SharedVisualTokens:
         """Ablate encoders by zeroing their tokens in place of a per-stream rerun.
 
