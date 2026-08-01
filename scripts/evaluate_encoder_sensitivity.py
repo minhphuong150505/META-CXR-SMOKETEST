@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate seven predeclared inference masks from one trained E123 checkpoint.
+"""Evaluate the six encoder configurations in paper Table 5 from one E123 checkpoint.
 
 All three frozen encoders run once per held-out batch. Inactive shared-token
 spans are removed before MHCAC for each subset. Results are sensitivity
@@ -36,7 +36,6 @@ MASKS = {
     "E3": ("swin",),
     "E12": ("biovil", "pubmedclip"),
     "E13": ("biovil", "swin"),
-    "E23": ("pubmedclip", "swin"),
     "E123": ("biovil", "pubmedclip", "swin"),
 }
 
@@ -98,15 +97,13 @@ def sensitivity_deltas(scores: dict[str, float]) -> dict:
     return {
         "E123_minus_pairs": {
             pair: scores["E123"] - scores[pair]
-            for pair in ("E12", "E13", "E23")
+            for pair in ("E12", "E13")
         },
         "pairs_minus_singletons": {
             "E12-E1": scores["E12"] - scores["E1"],
             "E12-E2": scores["E12"] - scores["E2"],
             "E13-E1": scores["E13"] - scores["E1"],
             "E13-E3": scores["E13"] - scores["E3"],
-            "E23-E2": scores["E23"] - scores["E2"],
-            "E23-E3": scores["E23"] - scores["E3"],
         },
     }
 

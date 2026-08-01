@@ -34,10 +34,11 @@ def test_training_config_is_exact_e123_multiview_policy():
     assert config["run"]["dataloader_timeout"] == 120
 
 
-def test_sensitivity_matrix_has_seven_predeclared_masks():
+def test_sensitivity_matrix_matches_the_six_table5_rows():
     source = (ROOT / "scripts/evaluate_encoder_sensitivity.py").read_text()
-    for run_id in ("E1", "E2", "E3", "E12", "E13", "E23", "E123"):
+    for run_id in ("E1", "E2", "E3", "E12", "E13", "E123"):
         assert f'"{run_id}"' in source
+    assert '"E23"' not in source
     assert "not causal contribution" in source
 
 
