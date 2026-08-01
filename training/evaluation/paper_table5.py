@@ -25,9 +25,29 @@ def paper_table5_weighted_f1(
     """Return Table-5's mean per-pathology weighted three-class F1.
 
     This is equivalent to applying ``sklearn.metrics.f1_score`` with
-    ``average='weighted'`` and ``zero_division=1`` to each of the five paper
+    ``average='weighted'`` and ``zero_division=0`` to each of the five paper
     pathologies, then taking an unweighted mean of the five scores.
     """
+    labels = np.asarray(labels)
+    logits = np.asarray(logits)
+    if labels.ndim != 2:
+        raise ValueError(f"labels must be [samples, pathologies], got {labels.shape}")
+    if logits.ndim != 3 or logits.shape[-1] != 3:
+        raise ValueError(
+            "logits must be [samples, pathologies, 3] for negative/positive/uncertain; "
+            f"got {logits.shape}"
+        )
+    if logits.shape[:2] != labels.shape:
+        raise ValueError(
+            f"label/logit shape mismatch: {labels.shape} vs {logits.shape[:2]}"
+        )
+    if len(pathology_names) != labels.shape[1]:
+        raise ValueError(
+            f"received {len(pathology_names)} pathology names for {labels.shape[1]} columns"
+        )
+    if len(set(pathology_names)) != len(pathology_names):
+        raise ValueError("pathology_names contains duplicates")
+
     indices = {name: index for index, name in enumerate(pathology_names)}
     missing = set(PAPER_TABLE5_PATHOLOGIES) - set(indices)
     if missing:
@@ -40,8 +60,10 @@ def paper_table5_weighted_f1(
     for name in PAPER_TABLE5_PATHOLOGIES:
         index = indices[name]
         truth = labels[:, index]
-        predicted = predictions[:, index]
         valid = (truth >= 0) & (truth < 3)
+        if not np.isfinite(logits[valid, index, :]).all():
+            raise ValueError(f"Non-finite Table-5 logits for {name}")
+        predicted = predictions[:, index]
         truth = truth[valid]
         predicted = predicted[valid]
         if truth.size == 0:
@@ -56,9 +78,8 @@ def paper_table5_weighted_f1(
             tp = int((true_class & predicted_class).sum())
             fp = int((~true_class & predicted_class).sum())
             fn = int((true_class & ~predicted_class).sum())
-            precision = 1.0 if tp + fp == 0 else tp / (tp + fp)
-            recall = 1.0 if tp + fn == 0 else tp / (tp + fn)
-            f1 = 0.0 if precision + recall == 0 else 2 * precision * recall / (precision + recall)
+            denominator = 2 * tp + fp + fn
+            f1 = 0.0 if denominator == 0 else 2 * tp / denominator
             weighted_sum += support * f1
             class_support[str(class_index)] = support
 

@@ -1227,10 +1227,15 @@ class Blip2Qformer(Blip2Base):
 
     @torch.no_grad()
     def classify_shared_visual(self, shared_visual, encoder_keep):
-        """Classify a pre-encoded batch after a declared stream mask."""
-        masked = self._apply_encoder_keep(shared_visual, encoder_keep)
+        """Classify with only the declared streams for Table-5 evaluation.
+
+        This is evaluation-only selection.  Removing inactive spans entirely is
+        important: zero-valued spans would become non-zero again after MHCAC's
+        biased projection and positional encoding.
+        """
+        selected = shared_visual.select(*encoder_keep)
         logits, _, _, _, _ = self.mhcac(
-            masked, text_embeddings=None, labels=None
+            selected, text_embeddings=None, labels=None
         )
         return logits
 
